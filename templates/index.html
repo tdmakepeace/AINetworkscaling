@@ -1,0 +1,469 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AMD — AI Spine-Leaf Network Designer</title>
+  <style>
+    /* Palette inspired by amd.com (AMD red on dark neutrals) */
+    :root {
+      --amd-red: #ed1c24;
+      --amd-red-hover: #ff2b33;
+      --amd-red-dim: rgba(237, 28, 36, 0.15);
+      --bg: #0a0a0a;
+      --bg-elevated: #111111;
+      --panel: #161616;
+      --panel-2: #1e1e1e;
+      --text: #f5f5f5;
+      --muted: #a8a8a8;
+      --accent: var(--amd-red);
+      --accent-2: #c4c4c4;
+      --danger: #ef4444;
+      --border: #2e2e2e;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background: linear-gradient(165deg, #0f0f0f 0%, var(--bg) 45%, #0d0d0d 100%);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    .amd-topbar {
+      height: 4px;
+      background: linear-gradient(90deg, var(--amd-red) 0%, #ff4d54 50%, var(--amd-red) 100%);
+    }
+    .site-header {
+      background: var(--bg-elevated);
+      border-bottom: 1px solid var(--border);
+    }
+    .header-inner {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 20px 32px 22px;
+      display: flex;
+      align-items: flex-start;
+      gap: 28px;
+      flex-wrap: wrap;
+    }
+    .amd-brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      text-decoration: none;
+      color: var(--text);
+      flex-shrink: 0;
+    }
+    .amd-brand:hover { color: #fff; }
+    .amd-brand:hover .amd-mark { background: var(--amd-red-hover); }
+    /* Simplified mark suggesting AMD corporate geometry (not a reproduction of the logo) */
+    .amd-mark {
+      width: 36px;
+      height: 28px;
+      background: var(--amd-red);
+      border-radius: 2px;
+      clip-path: polygon(0 0, 100% 0, 100% 72%, 72% 100%, 0 100%);
+      box-shadow: 0 0 20px var(--amd-red-dim);
+    }
+    .amd-word {
+      font-weight: 800;
+      font-size: 1.75rem;
+      letter-spacing: 0.02em;
+      line-height: 1;
+    }
+    .header-titles { flex: 1; min-width: 220px; }
+    .header-titles h1 {
+      margin: 0;
+      font-size: 1.35rem;
+      font-weight: 650;
+      letter-spacing: -0.02em;
+      line-height: 1.25;
+    }
+    .header-tagline {
+      margin: 8px 0 0;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.45;
+      max-width: 52ch;
+    }
+    .header-tagline a {
+      color: var(--amd-red-hover);
+      text-decoration: none;
+    }
+    .header-tagline a:hover { text-decoration: underline; }
+    .header-links {
+      margin-top: 10px;
+      font-size: 12px;
+    }
+    .header-links a {
+      color: var(--amd-red-hover);
+      text-decoration: none;
+      margin-right: 16px;
+    }
+    .header-links a:hover { text-decoration: underline; }
+    .layout {
+      display: grid;
+      grid-template-columns: 360px 1fr;
+      gap: 24px;
+      padding: 24px 32px 40px;
+    }
+    @media (max-width: 960px) {
+      .layout { grid-template-columns: 1fr; }
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 20px;
+    }
+    .panel h2 {
+      margin: 0 0 14px;
+      font-size: 15px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--accent-2);
+      border-left: 3px solid var(--amd-red);
+      padding-left: 10px;
+    }
+    label {
+      display: block;
+      font-size: 13px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    input[type=number], select {
+      width: 100%;
+      padding: 10px 12px;
+      background: var(--panel-2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 14px;
+      outline: none;
+    }
+    input[type=number]:focus, select:focus {
+      border-color: var(--amd-red);
+      box-shadow: 0 0 0 3px var(--amd-red-dim);
+    }
+    .field { margin-bottom: 14px; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    button {
+      width: 100%;
+      margin-top: 6px;
+      padding: 12px 14px;
+      background: linear-gradient(180deg, var(--amd-red-hover), var(--amd-red));
+      border: none;
+      border-radius: 10px;
+      color: white;
+      font-weight: 600;
+      font-size: 14px;
+      cursor: pointer;
+      box-shadow: 0 2px 12px var(--amd-red-dim);
+    }
+    button:hover { filter: brightness(1.06); }
+    button:active { transform: translateY(1px); }
+
+    .results { display: flex; flex-direction: column; gap: 20px; }
+    .kpis {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 14px;
+    }
+    @media (max-width: 720px) { .kpis { grid-template-columns: repeat(2, 1fr); } }
+    .kpi {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px 16px;
+    }
+    .kpi .label {
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .kpi .value {
+      font-size: 26px;
+      font-weight: 700;
+      margin-top: 4px;
+      color: #fff;
+    }
+    .kpi .sub {
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 2px;
+    }
+    .diagram {
+      background: #fafafa;
+      border-radius: 14px;
+      padding: 12px;
+      overflow-x: auto;
+      border: 1px solid var(--border);
+    }
+    .diagram svg { display: block; width: 100%; height: auto; }
+    .notes ul { margin: 6px 0 0 18px; padding: 0; }
+    .notes li { margin: 4px 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
+    .error {
+      background: rgba(239, 68, 68, 0.12);
+      border: 1px solid rgba(239, 68, 68, 0.4);
+      color: #fecaca;
+      padding: 10px 14px;
+      border-radius: 10px;
+      font-size: 13px;
+    }
+    .warn {
+      background: rgba(250, 204, 21, 0.1);
+      border: 1px solid rgba(250, 204, 21, 0.35);
+      color: #fde68a;
+      padding: 10px 14px;
+      border-radius: 10px;
+      font-size: 13px;
+    }
+    footer {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 8px 32px 36px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.55;
+      border-top: 1px solid var(--border);
+    }
+    footer a { color: var(--amd-red-hover); text-decoration: none; }
+    footer a:hover { text-decoration: underline; }
+    .footer-disclaimer {
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border);
+      font-size: 11px;
+      color: #888;
+    }
+  </style>
+</head>
+<body>
+  <header class="site-header">
+    <div class="amd-topbar" aria-hidden="true"></div>
+    <div class="header-inner">
+      <a class="amd-brand" href="https://www.amd.com/" target="_blank" rel="noopener noreferrer" title="AMD.com">
+        <span class="amd-mark" aria-hidden="true"></span>
+        <span class="amd-word">AMD</span>
+      </a>
+      <div class="header-titles">
+        <h1>AI Spine-Leaf Network Designer</h1>
+        <p class="header-tagline">
+          Size a non-blocking (1:1) spine-leaf fabric for accelerated compute clusters—aligned with how
+          <a href="https://www.amd.com/en/products/accelerators/instinct.html" target="_blank" rel="noopener noreferrer">AMD Instinct™</a>
+          GPUs are deployed in scale-out AI networks.
+        </p>
+        <div class="header-links">
+          <a href="https://www.amd.com/en/solutions/data-center.html" target="_blank" rel="noopener noreferrer">Data center</a>
+          <a href="https://www.amd.com/en/products/accelerators/instinct.html" target="_blank" rel="noopener noreferrer">Instinct accelerators</a>
+          <a href="https://www.amd.com/en/products/software/rocm.html" target="_blank" rel="noopener noreferrer">ROCm™</a>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <div class="layout">
+    <form class="panel" method="post">
+      <h2>Inputs</h2>
+
+      <div class="field">
+        <label for="num_gpus">Number of GPUs</label>
+        <input id="num_gpus" name="num_gpus" type="number" min="1" value="{{ form.num_gpus }}" required />
+      </div>
+
+      <div class="row">
+        <div class="field">
+          <label for="gpus_per_node">GPUs per node</label>
+          <input id="gpus_per_node" name="gpus_per_node" type="number" min="1" value="{{ form.gpus_per_node }}" required />
+        </div>
+        <div class="field">
+          <label for="nics_per_gpu">NICs per GPU</label>
+          <select id="nics_per_gpu" name="nics_per_gpu">
+            <option value="1" {% if form.nics_per_gpu == 1 %}selected{% endif %}>1</option>
+            <option value="2" {% if form.nics_per_gpu == 2 %}selected{% endif %}>2</option>
+            <option value="3" {% if form.nics_per_gpu == 3 %}selected{% endif %}>3</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="plans_per_nic">Plans per NIC</label>
+        <select id="plans_per_nic" name="plans_per_nic">
+          <option value="1" {% if form.plans_per_nic == 1 %}selected{% endif %}>1</option>
+          <option value="2" {% if form.plans_per_nic == 2 %}selected{% endif %}>2</option>
+          <option value="4" {% if form.plans_per_nic == 4 %}selected{% endif %}>4</option>
+        </select>
+      </div>
+      <p style="font-size: 12px; color: var(--muted); margin: -8px 0 10px;">
+        <b>Plans per NIC</b> controls NIC breakout: 1 = 1x400G, 2 = 2x200G, 4 = 4x100G (for 400G NICs).
+        Total plans = plans_per_nic &times; NICs per GPU.
+      </p>
+
+      <div class="row">
+        <div class="field">
+          <label for="spine_ports">Ports per spine switch</label>
+          <input id="spine_ports" name="spine_ports" type="number" min="2" value="{{ form.spine_ports }}" required />
+        </div>
+        <div class="field">
+          <label for="leaf_ports">Ports per leaf switch</label>
+          <input id="leaf_ports" name="leaf_ports" type="number" min="2" value="{{ form.leaf_ports }}" required />
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="nic_speed">NIC speed</label>
+        <select id="nic_speed" name="nic_speed">
+          <option value="400" {% if form.nic_speed == 400 %}selected{% endif %}>400G</option>
+          <option value="800" {% if form.nic_speed == 800 %}selected{% endif %}>800G</option>
+        </select>
+      </div>
+
+      <div class="row">
+        <div class="field">
+          <label for="leaf_speed">Leaf port speed</label>
+          <select id="leaf_speed" name="leaf_speed">
+            <option value="400" {% if form.leaf_speed == 400 %}selected{% endif %}>400G</option>
+            <option value="800" {% if form.leaf_speed == 800 %}selected{% endif %}>800G</option>
+            <option value="1600" {% if form.leaf_speed == 1600 %}selected{% endif %}>1.6T</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="spine_speed">Spine port speed</label>
+          <select id="spine_speed" name="spine_speed">
+            <option value="400" {% if form.spine_speed == 400 %}selected{% endif %}>400G</option>
+            <option value="800" {% if form.spine_speed == 800 %}selected{% endif %}>800G</option>
+            <option value="1600" {% if form.spine_speed == 1600 %}selected{% endif %}>1.6T</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="super_spine_speed">Super-spine (used only if needed)</label>
+        <select id="super_spine_speed" name="super_spine_speed">
+          <option value="0" {% if form.super_spine_speed == 0 %}selected{% endif %}>Not used</option>
+          <option value="800" {% if form.super_spine_speed == 800 %}selected{% endif %}>Enable at 800G</option>
+          <option value="1600" {% if form.super_spine_speed == 1600 %}selected{% endif %}>Enable at 1.6T</option>
+        </select>
+      </div>
+
+      <p style="font-size: 12px; color: var(--muted); margin: -4px 0 10px;">
+        Breakout cables are assumed when a port runs faster than what it connects to.
+        A super-spine tier is only introduced when the 2-tier spine-leaf can't fan
+        out wide enough for the requested GPU count.
+      </p>
+
+      <button type="submit">Design fabric</button>
+    </form>
+
+    <div class="results">
+      {% if error %}
+        <div class="error">{{ error }}</div>
+      {% endif %}
+
+      {% if result %}
+        {% if not result.feasible %}
+          <div class="warn">Design is not feasible with the inputs provided. See notes below.</div>
+        {% endif %}
+
+        <div class="kpis">
+          <div class="kpi">
+            <div class="label">Nodes</div>
+            <div class="value">{{ result.total_nodes }}</div>
+            <div class="sub">{{ result.inputs.gpus_per_node }} GPUs each</div>
+          </div>
+          <div class="kpi">
+            <div class="label">Leaf switches</div>
+            <div class="value">{{ result.total_leaves }}</div>
+            <div class="sub">
+              {% if result.topology == "single-switch" %}
+                single-switch &times; {{ result.num_planes }} plan(s)
+              {% else %}
+                {{ result.plane.leaves_per_plane }}/plan &times; {{ result.num_planes }} plan(s)
+              {% endif %}
+            </div>
+          </div>
+          {% if result.topology == "single-switch" %}
+          <div class="kpi">
+            <div class="label">Spine switches</div>
+            <div class="value">0</div>
+            <div class="sub">not required - collapsed design</div>
+          </div>
+          <div class="kpi">
+            <div class="label">GPUs per leaf</div>
+            <div class="value">{{ result.plane.gpus_per_leaf }}</div>
+            <div class="sub">{{ result.plane.downlink_ports_per_leaf }} ports &times; {{ result.plane.leaf_breakout }} breakout</div>
+          </div>
+          {% else %}
+          <div class="kpi">
+            <div class="label">Spine switches</div>
+            <div class="value">{{ result.total_spines }}</div>
+            <div class="sub">
+              {% if result.plane.uses_super_spine %}
+                {{ result.plane.spines_per_pod }}/pod &times; {{ result.plane.pods_per_plane }} pod(s) &times; {{ result.num_planes }} plan(s)
+              {% else %}
+                {{ result.plane.spines_per_plane }}/plan &times; {{ result.num_planes }} plan(s)
+              {% endif %}
+            </div>
+          </div>
+          {% if result.plane.uses_super_spine %}
+          <div class="kpi">
+            <div class="label">Super-spines</div>
+            <div class="value">{{ result.total_super_spines }}</div>
+            <div class="sub">{{ result.plane.super_spines_per_plane }}/plan @ {{ result.plane.super_spine_speed }}G</div>
+          </div>
+          {% else %}
+          <div class="kpi">
+            <div class="label">GPUs per leaf</div>
+            <div class="value">{{ result.plane.gpus_per_leaf }}</div>
+            <div class="sub">{{ result.plane.downlink_ports_per_leaf }} ports &times; {{ result.plane.leaf_breakout }} breakout</div>
+          </div>
+          {% endif %}
+          {% endif %}
+        </div>
+
+        <div class="panel diagram">
+          {{ svg | safe }}
+        </div>
+
+        {% if result.cables %}
+        <div class="panel notes">
+          <h2>Cables ({{ result.num_planes }} plan(s) combined)</h2>
+          <ul>
+            {% for c in result.cables %}
+              <li><b>{{ c.end_a }} &harr; {{ c.end_b }}:</b> {{ "{:,}".format(c.count) }} &times; {{ c.label }}</li>
+            {% endfor %}
+          </ul>
+        </div>
+        {% endif %}
+
+        <div class="panel notes">
+          <h2>Design notes</h2>
+          <ul>
+            {% for n in result.notes %}<li>{{ n }}</li>{% endfor %}
+          </ul>
+        </div>
+      {% else %}
+        <div class="panel">
+          <h2>Results</h2>
+          <p style="color: var(--muted); font-size: 14px; margin: 0;">
+            Fill in the inputs and press <b>Design fabric</b> to compute the leaf
+            and spine switch counts and see a topology diagram.
+          </p>
+        </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <footer>
+    <strong>Model assumptions:</strong> classic spine-leaf (and optional super-spine), 1:1 subscription where stated.
+    <b>Plans per NIC</b> defines NIC port breakout and total plans, multiplied by <b>NICs per GPU</b>.
+    <div class="footer-disclaimer">
+      Visual styling references the look and feel of
+      <a href="https://www.amd.com/" target="_blank" rel="noopener noreferrer">amd.com</a>
+      (AMD red on dark neutrals). AMD, Instinct, ROCm, EPYC, and combinations thereof are trademarks of
+      Advanced Micro Devices, Inc. This tool is an independent sizing aid and is not affiliated with or endorsed by AMD.
+    </div>
+  </footer>
+</body>
+</html>
