@@ -237,6 +237,168 @@
       font-size: 11px;
       color: #888;
     }
+    .button-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    .button-secondary {
+      background: linear-gradient(180deg, #2e2e2e, #232323);
+      box-shadow: none;
+      border: 1px solid #3a3a3a;
+    }
+    .compare-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    .compare-table th, .compare-table td {
+      border: 1px solid var(--border);
+      padding: 8px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+    .compare-table th {
+      color: var(--accent-2);
+      background: #1b1b1b;
+      font-weight: 650;
+    }
+    .compare-table td {
+      color: var(--text);
+      background: #151515;
+    }
+    .compare-table td.muted {
+      color: var(--muted);
+    }
+    .bom-layer {
+      margin-top: 18px;
+      padding-top: 14px;
+      border-top: 1px solid var(--border);
+    }
+    .bom-layer:first-of-type {
+      margin-top: 0;
+      padding-top: 0;
+      border-top: none;
+    }
+    .bom-layer h3 {
+      margin: 0 0 10px;
+      font-size: 14px;
+      font-weight: 650;
+      color: var(--text);
+    }
+    .bom-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      margin-top: 8px;
+    }
+    .bom-table th, .bom-table td {
+      border: 1px solid var(--border);
+      padding: 8px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+    .bom-table th {
+      color: var(--accent-2);
+      background: #1b1b1b;
+      font-weight: 650;
+      width: 28%;
+    }
+    .bom-table td {
+      background: #151515;
+      color: var(--text);
+    }
+    .bom-shuffle {
+      margin-top: 20px;
+      padding: 12px 14px;
+      background: #1a1a1a;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      font-size: 13px;
+    }
+    .bom-shuffle strong { color: var(--amd-red-hover); }
+
+    /* Compare plans modal */
+    .compare-modal {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 1000;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    .compare-modal.is-open {
+      display: flex;
+    }
+    .compare-modal-backdrop {
+      position: absolute;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.72);
+      cursor: pointer;
+    }
+    .compare-modal-dialog {
+      position: relative;
+      width: min(1100px, 100%);
+      max-height: min(88vh, 900px);
+      display: flex;
+      flex-direction: column;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      box-shadow: 0 24px 80px rgba(0, 0, 0, 0.55);
+    }
+    .compare-modal-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 18px 20px 14px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .compare-modal-header h2 {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 650;
+      line-height: 1.35;
+      padding-left: 10px;
+      border-left: 3px solid var(--amd-red);
+    }
+    .compare-modal-header p {
+      margin: 8px 0 0;
+      font-size: 13px;
+      color: var(--muted);
+      max-width: 52ch;
+    }
+    .compare-modal-close {
+      flex-shrink: 0;
+      width: 40px;
+      height: 40px;
+      margin: 0;
+      padding: 0;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--text);
+      font-size: 22px;
+      line-height: 1;
+      cursor: pointer;
+      box-shadow: none;
+    }
+    .compare-modal-close:hover {
+      filter: brightness(1.08);
+      border-color: var(--amd-red);
+    }
+    .compare-modal-body {
+      padding: 16px 20px 20px;
+      overflow: auto;
+      flex: 1;
+      min-height: 0;
+    }
+    .compare-modal-body .compare-table {
+      margin: 0;
+    }
   </style>
 </head>
 <body>
@@ -290,14 +452,16 @@
       <div class="field">
         <label for="plans_per_nic">Plans per NIC</label>
         <select id="plans_per_nic" name="plans_per_nic">
+          <option value="0" {% if form.plans_per_nic == 0 %}selected{% endif %}>0 (single plan)</option>
           <option value="1" {% if form.plans_per_nic == 1 %}selected{% endif %}>1</option>
           <option value="2" {% if form.plans_per_nic == 2 %}selected{% endif %}>2</option>
           <option value="4" {% if form.plans_per_nic == 4 %}selected{% endif %}>4</option>
         </select>
       </div>
       <p style="font-size: 12px; color: var(--muted); margin: -8px 0 10px;">
-        <b>Plans per NIC</b> controls NIC breakout: 1 = 1x400G, 2 = 2x200G, 4 = 4x100G (for 400G NICs).
-        Total plans = plans_per_nic &times; NICs per GPU.
+        <b>Plans per NIC</b> controls NIC breakout: 0 = single plan (all NICs in one fabric), 1 = 1x400G,
+        2 = 2x200G, 4 = 4x100G (for 400G NICs). For values above 0, total plans = plans_per_nic &times;
+        NICs per GPU.
       </p>
 
       <div class="row">
@@ -353,7 +517,10 @@
         out wide enough for the requested GPU count.
       </p>
 
-      <button type="submit">Design fabric</button>
+      <div class="button-row">
+        <button type="submit" name="action" value="design">Design fabric</button>
+        <button class="button-secondary" type="submit" name="action" value="compare">Compare plans</button>
+      </div>
     </form>
 
     <div class="results">
@@ -426,6 +593,74 @@
           {{ svg | safe }}
         </div>
 
+        {% if result.bom %}
+        <div class="panel notes">
+          <h2>Bill of materials</h2>
+          <p style="color: var(--muted); font-size: 13px; margin: 0 0 6px;">
+            Per-layer switch counts (radix &amp; port speed) and cable quantities with optic/cable type labels
+            (breakout forms such as <code>800G-2x400G</code> are as modeled in the design).
+          </p>
+
+          {% set bom = result.bom %}
+
+          <div class="bom-layer">
+            <h3>{{ bom.super_spine.title }}</h3>
+            {% if bom.super_spine.layer_note %}
+              <p style="color: var(--muted); font-size: 12px; margin: 0 0 8px;">{{ bom.super_spine.layer_note }}</p>
+            {% endif %}
+            <table class="bom-table">
+              <tr><th>Switches</th><td>{{ "{:,}".format(bom.super_spine.switch_quantity) }} &times; {{ bom.super_spine.switch_specification }}</td></tr>
+              {% if bom.super_spine.cable_lines %}
+                {% for line in bom.super_spine.cable_lines %}
+                <tr><th>Cables to spine</th><td>{{ "{:,}".format(line.quantity) }} &times; {{ line.specification }}</td></tr>
+                {% endfor %}
+              {% else %}
+                <tr><th>Cables to spine</th><td>—</td></tr>
+              {% endif %}
+            </table>
+          </div>
+
+          <div class="bom-layer">
+            <h3>{{ bom.spine.title }}</h3>
+            {% if bom.spine.layer_note %}
+              <p style="color: var(--muted); font-size: 12px; margin: 0 0 8px;">{{ bom.spine.layer_note }}</p>
+            {% endif %}
+            <table class="bom-table">
+              <tr><th>Switches</th><td>{{ "{:,}".format(bom.spine.switch_quantity) }} &times; {{ bom.spine.switch_specification }}</td></tr>
+              {% if bom.spine.cable_lines %}
+                {% for line in bom.spine.cable_lines %}
+                <tr><th>Cables to leaf</th><td>{{ "{:,}".format(line.quantity) }} &times; {{ line.specification }}</td></tr>
+                {% endfor %}
+              {% else %}
+                <tr><th>Cables to leaf</th><td>—</td></tr>
+              {% endif %}
+            </table>
+          </div>
+
+          <div class="bom-layer">
+            <h3>{{ bom.leaf.title }}</h3>
+            {% if bom.leaf.layer_note %}
+              <p style="color: var(--muted); font-size: 12px; margin: 0 0 8px;">{{ bom.leaf.layer_note }}</p>
+            {% endif %}
+            <table class="bom-table">
+              <tr><th>Switches</th><td>{{ "{:,}".format(bom.leaf.switch_quantity) }} &times; {{ bom.leaf.switch_specification }}</td></tr>
+              {% if bom.leaf.cable_lines %}
+                {% for line in bom.leaf.cable_lines %}
+                <tr><th>Cables to node</th><td>{{ "{:,}".format(line.quantity) }} &times; {{ line.specification }}</td></tr>
+                {% endfor %}
+              {% else %}
+                <tr><th>Cables to node</th><td>—</td></tr>
+              {% endif %}
+            </table>
+          </div>
+
+          <div class="bom-shuffle">
+            <strong>Shuffle boxes (node-side plan split):</strong>
+            <span style="color: var(--muted);"> {{ bom.shuffle_box_note }}</span>
+          </div>
+        </div>
+        {% endif %}
+
         {% if result.cables %}
         <div class="panel notes">
           <h2>Cables ({{ result.num_planes }} plan(s) combined)</h2>
@@ -443,17 +678,97 @@
             {% for n in result.notes %}<li>{{ n }}</li>{% endfor %}
           </ul>
         </div>
+
       {% else %}
         <div class="panel">
           <h2>Results</h2>
           <p style="color: var(--muted); font-size: 14px; margin: 0;">
             Fill in the inputs and press <b>Design fabric</b> to compute the leaf
-            and spine switch counts and see a topology diagram.
+            and spine switch counts and see a topology diagram. Use <b>Compare plans</b>
+            to evaluate plans-per-NIC values side by side.
           </p>
         </div>
       {% endif %}
     </div>
   </div>
+
+  {% if compare_rows %}
+  <div
+    id="compare-modal"
+    class="compare-modal is-open"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="compare-modal-title"
+    aria-hidden="false"
+  >
+    <div class="compare-modal-backdrop" data-compare-close></div>
+    <div class="compare-modal-dialog">
+      <div class="compare-modal-header">
+        <div>
+          <h2 id="compare-modal-title">Plans-per-NIC comparison</h2>
+          <p>
+            {{ form.num_gpus }} GPUs, {{ form.nics_per_gpu }} NIC/GPU — pick <b>plans per NIC</b>, then run <b>Design fabric</b>.
+          </p>
+        </div>
+        <button type="button" class="compare-modal-close" data-compare-close aria-label="Close comparison">&times;</button>
+      </div>
+      <div class="compare-modal-body">
+        <table class="compare-table">
+          <thead>
+            <tr>
+              <th>Plans/NIC</th>
+              <th>Feasible</th>
+              <th>Topology</th>
+              <th>Leaf</th>
+              <th>Spine</th>
+              <th>Super-spine</th>
+              <th>Total cables</th>
+              <th>Cable breakdown</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in compare_rows %}
+            <tr>
+              <td>{{ row.plans_per_nic }}</td>
+              <td>{{ row.feasible }}</td>
+              <td>{{ row.topology }}</td>
+              <td>{{ "{:,}".format(row.leaf_switches) }}</td>
+              <td>{{ "{:,}".format(row.spine_switches) }}</td>
+              <td>{{ "{:,}".format(row.super_spine_switches) }}</td>
+              <td>{{ "{:,}".format(row.total_cables) }}</td>
+              <td class="muted">{{ row.cable_breakdown }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <script>
+    (function () {
+      var modal = document.getElementById("compare-modal");
+      if (!modal) return;
+
+      document.body.style.overflow = "hidden";
+
+      function closeModal() {
+        modal.classList.remove("is-open");
+        modal.setAttribute("aria-hidden", "true");
+        document.body.style.overflow = "";
+      }
+
+      modal.querySelectorAll("[data-compare-close]").forEach(function (el) {
+        el.addEventListener("click", closeModal);
+      });
+
+      document.addEventListener("keydown", function (e) {
+        if (e.key === "Escape" && modal.classList.contains("is-open")) {
+          closeModal();
+        }
+      });
+    })();
+  </script>
+  {% endif %}
 
   <footer>
     <strong>Model assumptions:</strong> classic spine-leaf (and optional super-spine), 1:1 subscription where stated.

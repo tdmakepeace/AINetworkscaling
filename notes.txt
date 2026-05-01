@@ -1,2 +1,17 @@
-# submission plan..
+# Build EXE single package. 
+# make sure debug is false, and browser only in false in app.py file first. 
 
+python -m venv venv
+venv\Scripts\Activate.ps1
+
+pip install auto-py-to-exe
+pip install -r .\requirements.txt
+python -m pip install pyinstaller --upgrade
+python -m pip install auto-py-to-exe --upgrade
+
+auto-py-to-exe
+
+# import the json, or set the following settings.
+# add he folder for templates to be included in  one file, windows based.
+
+exit

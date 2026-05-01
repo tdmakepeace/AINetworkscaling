@@ -14,12 +14,15 @@ allowed values (400 / 800 / 1600).
 """
 
 from __future__ import annotations
+from pickle import FALSE
 import webview
 import threading
 import time
 import urllib.request
 import math
 from dataclasses import dataclass, field
+from typing import Optional
+
 from flask import Flask, render_template, request
 
 app = Flask(__name__)
@@ -29,25 +32,26 @@ app = Flask(__name__)
 # Design logic
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class DesignInputs:
     num_gpus: int
     gpus_per_node: int
-    nics_per_gpu: int            # 1, 2, 3 -> NICs per GPU
+    nics_per_gpu: int  # 1, 2, 3 -> NICs per GPU
     spine_ports: int
     leaf_ports: int
-    nic_speed: int               # 400 or 800
-    leaf_speed: int              # 400, 800 or 1600
-    spine_speed: int             # 400, 800 or 1600
-    super_spine_speed: int = 0   # 0 = not used, else 800 or 1600
-    plans_per_nic: int = 1       # 1, 2, or 4; NIC breakout: 1x, 2x, or 4x
+    nic_speed: int  # 400 or 800
+    leaf_speed: int  # 400, 800 or 1600
+    spine_speed: int  # 400, 800 or 1600
+    super_spine_speed: int = 0  # 0 = not used, else 800 or 1600
+    plans_per_nic: int = 1  # 0, 1, 2, or 4; 0 = all NICs in one plan
 
 
 @dataclass
 class PlaneDesign:
     # Speeds and breakouts
-    nic_speed: int               # Effective NIC link speed per plan
-    nic_speed_raw: int           # Physical NIC port speed before plans_per_nic split
+    nic_speed: int  # Effective NIC link speed per plan
+    nic_speed_raw: int  # Physical NIC port speed before plans_per_nic split
     leaf_speed: int
     spine_speed: int
     super_spine_speed: int
@@ -65,16 +69,16 @@ class PlaneDesign:
     leaves_per_plane: int
 
     # 2-tier specifics (also used inside each pod in 3-tier)
-    spines_per_plane: int                 # total spines in the plane
+    spines_per_plane: int  # total spines in the plane
     links_per_leaf_to_each_spine: int
-    spine_ports_used_for_leaves: int      # per spine
+    spine_ports_used_for_leaves: int  # per spine
 
     # 3-tier specifics
     uses_super_spine: bool = False
     leaves_per_pod: int = 0
     spines_per_pod: int = 0
     pods_per_plane: int = 0
-    spine_ports_up_to_super: int = 0      # per spine
+    spine_ports_up_to_super: int = 0  # per spine
     super_spines_per_plane: int = 0
     ports_used_per_super_spine: int = 0
 
@@ -83,10 +87,10 @@ class PlaneDesign:
 
 @dataclass
 class CableGroup:
-    count: int            # total physical cables (summed across planes)
-    label: str            # e.g. "800G-2x400G" or "800G-800G"
-    end_a: str            # e.g. "Leaf"
-    end_b: str            # e.g. "Node"
+    count: int  # total physical cables (summed across planes)
+    label: str  # e.g. "800G-2x400G" or "800G-800G"
+    end_a: str  # e.g. "Leaf"
+    end_b: str  # e.g. "Node"
 
 
 @dataclass
@@ -101,7 +105,34 @@ class DesignResult:
     cables: list[CableGroup] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     feasible: bool = True
-    topology: str = "spine-leaf"     # "single-switch", "spine-leaf", "3-tier"
+    topology: str = "spine-leaf"  # "single-switch", "spine-leaf", "3-tier"
+    bom: Optional["BillOfMaterials"] = None
+
+
+@dataclass
+class BOMCableLine:
+    quantity: int
+    specification: str
+
+
+@dataclass
+class BOMLayer:
+    """One fabric layer: switch count/spec and cable lines for that hop."""
+
+    title: str
+    switch_quantity: int
+    switch_specification: str
+    cable_lines: list[BOMCableLine] = field(default_factory=list)
+    layer_note: str = ""
+
+
+@dataclass
+class BillOfMaterials:
+    super_spine: BOMLayer
+    spine: BOMLayer
+    leaf: BOMLayer
+    shuffle_box_quantity: int
+    shuffle_box_note: str
 
 
 def _compute_fanouts(a: int, b: int) -> tuple[int, int]:
@@ -114,15 +145,17 @@ def _compute_fanouts(a: int, b: int) -> tuple[int, int]:
     return 1, max(1, b // a)
 
 
-def _cable_label(speed_a: int, fanout_a_to_b: int,
-                 speed_b: int, fanout_b_to_a: int) -> str:
+def _cable_label(
+    speed_a: int, fanout_a_to_b: int, speed_b: int, fanout_b_to_a: int
+) -> str:
     """Build a cable-type label like '800G-800G' or '800G-2x400G'."""
     a = _fmt_speed(speed_a)
     b = _fmt_speed(speed_b)
     if fanout_a_to_b > 1:
         return f"{a}-{fanout_a_to_b}x{b}"
     if fanout_b_to_a > 1:
-        return f"{fanout_b_to_a}x{a}-{b}"
+        # Faster side first, then breakout toward slower (e.g. 800G-2x400G not 2x400G-800G).
+        return f"{b}-{fanout_b_to_a}x{a}"
     return f"{a}-{b}"
 
 
@@ -134,16 +167,20 @@ def _cable_count(total_links: int, fanout_a_to_b: int, fanout_b_to_a: int) -> in
     return math.ceil(total_links / per_cable)
 
 
-def design_fabric(inp: DesignInputs) -> DesignResult:
+def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
     notes: list[str] = []
 
-    num_planes = inp.plans_per_nic * inp.nics_per_gpu
-    nic_plan_speed = inp.nic_speed // inp.plans_per_nic
+    single_plan_mode = inp.plans_per_nic == 0
+    num_planes = 1 if single_plan_mode else inp.plans_per_nic * inp.nics_per_gpu
+    nic_plan_speed = (
+        inp.nic_speed if single_plan_mode else inp.nic_speed // inp.plans_per_nic
+    )
 
-    if inp.nic_speed % inp.plans_per_nic != 0:
+    if not single_plan_mode and inp.nic_speed % inp.plans_per_nic != 0:
         return _infeasible(
             inp,
-            notes + [
+            notes
+            + [
                 f"NIC speed ({inp.nic_speed}G) must be divisible by plans_per_nic ({inp.plans_per_nic})."
             ],
         )
@@ -152,11 +189,17 @@ def design_fabric(inp: DesignInputs) -> DesignResult:
     if inp.leaf_speed < nic_plan_speed or inp.leaf_speed % nic_plan_speed != 0:
         return _infeasible(
             inp,
-            notes + ["Leaf port speed must be >= NIC speed and an integer multiple of it."],
+            notes
+            + ["Leaf port speed must be >= NIC speed and an integer multiple of it."],
         )
 
-    # Distribute GPUs across parallel fabrics first, then size each.
-    gpus_per_plane = math.ceil(inp.num_gpus / num_planes)
+    # Distribute endpoints across parallel fabrics first, then size each.
+    # In single-plan mode (plans_per_nic=0), all NICs stay in one fabric.
+    gpus_per_plane = (
+        inp.num_gpus * inp.nics_per_gpu
+        if single_plan_mode
+        else math.ceil(inp.num_gpus / num_planes)
+    )
 
     # Breakouts
     leaf_breakout = inp.leaf_speed // nic_plan_speed
@@ -165,14 +208,21 @@ def design_fabric(inp: DesignInputs) -> DesignResult:
     )
 
     # --- Plans note -------------------------------------------------------
-    notes.append(
-        f"Parallel fabrics: plans_per_nic x NICs_per_GPU = "
-        f"{inp.plans_per_nic} x {inp.nics_per_gpu} = {num_planes} plan(s). "
-        f"NIC breakout per GPU NIC: 1x{inp.nic_speed}G -> "
-        f"{inp.plans_per_nic}x{nic_plan_speed}G. "
-        f"GPUs split before sizing: {inp.num_gpus} total / {num_planes} = "
-        f"{gpus_per_plane} GPUs per plan (rounded up)."
-    )
+    if single_plan_mode:
+        notes.append(
+            f"Single-plan mode enabled: all NICs stay in one fabric plan "
+            f"({inp.num_gpus} GPUs x {inp.nics_per_gpu} NIC/GPU = "
+            f"{gpus_per_plane} NIC endpoints in the plan)."
+        )
+    else:
+        notes.append(
+            f"Parallel fabrics: plans_per_nic x NICs_per_GPU = "
+            f"{inp.plans_per_nic} x {inp.nics_per_gpu} = {num_planes} plan(s). "
+            f"NIC breakout per GPU NIC: 1x{inp.nic_speed}G -> "
+            f"{inp.plans_per_nic}x{nic_plan_speed}G. "
+            f"GPUs split before sizing: {inp.num_gpus} total / {num_planes} = "
+            f"{gpus_per_plane} GPUs per plan (rounded up)."
+        )
 
     # --- Single-switch short-circuit ------------------------------------
     # If all GPU NICs in a plane fit on one leaf switch using every port as a
@@ -180,8 +230,9 @@ def design_fabric(inp: DesignInputs) -> DesignResult:
     # terminates the whole plane.
     max_gpus_one_switch = inp.leaf_ports * leaf_breakout
     if gpus_per_plane <= max_gpus_one_switch:
-        return _single_switch_result(inp, num_planes, gpus_per_plane,
-                                     leaf_breakout, notes)
+        return _single_switch_result(
+            inp, num_planes, gpus_per_plane, leaf_breakout, notes
+        )
 
     # --- Leaf port split for 1:1 ----------------------------------------
     downlink_ports = inp.leaf_ports // 2
@@ -246,18 +297,29 @@ def design_fabric(inp: DesignInputs) -> DesignResult:
                 f"Super-spine ({inp.super_spine_speed}G) not required at this "
                 "scale - not included in the design."
             )
-        _add_common_notes(notes, inp, leaf_breakout, leaf_to_spine_fanout,
-                          spine_to_leaf_fanout, downlink_ports, uplink_ports,
-                          gpus_per_leaf, num_planes)
+        _add_common_notes(
+            notes,
+            inp,
+            leaf_breakout,
+            leaf_to_spine_fanout,
+            spine_to_leaf_fanout,
+            downlink_ports,
+            uplink_ports,
+            gpus_per_leaf,
+            num_planes,
+        )
         plane = PlaneDesign(**plane_kwargs)
         return DesignResult(
-            inputs=inp, num_planes=num_planes, plane=plane,
+            inputs=inp,
+            num_planes=num_planes,
+            plane=plane,
             total_leaves=leaves_per_plane * num_planes,
             total_spines=spines_per_plane * num_planes,
             total_super_spines=0,
             total_nodes=math.ceil(inp.num_gpus / inp.gpus_per_node),
             cables=_compute_cables(inp, plane, num_planes),
-            notes=notes, feasible=True,
+            notes=notes,
+            feasible=True,
             topology="spine-leaf",
         )
 
@@ -269,17 +331,28 @@ def design_fabric(inp: DesignInputs) -> DesignResult:
             f"(after {spine_to_leaf_fanout}:1 breakout), but spines only have "
             f"{inp.spine_ports} ports. Enable a super-spine tier to continue."
         )
-        _add_common_notes(notes, inp, leaf_breakout, leaf_to_spine_fanout,
-                          spine_to_leaf_fanout, downlink_ports, uplink_ports,
-                          gpus_per_leaf, num_planes)
+        _add_common_notes(
+            notes,
+            inp,
+            leaf_breakout,
+            leaf_to_spine_fanout,
+            spine_to_leaf_fanout,
+            downlink_ports,
+            uplink_ports,
+            gpus_per_leaf,
+            num_planes,
+        )
         plane = PlaneDesign(**plane_kwargs)
         return DesignResult(
-            inputs=inp, num_planes=num_planes, plane=plane,
+            inputs=inp,
+            num_planes=num_planes,
+            plane=plane,
             total_leaves=leaves_per_plane * num_planes,
             total_spines=0,
             total_super_spines=0,
             total_nodes=math.ceil(inp.num_gpus / inp.gpus_per_node),
-            notes=notes, feasible=False,
+            notes=notes,
+            feasible=False,
         )
 
     # --- 3-tier (super-spine) sizing ------------------------------------
@@ -290,7 +363,7 @@ def design_fabric(inp: DesignInputs) -> DesignResult:
     leaves_per_pod = spine_ports_down * spine_to_leaf_fanout
 
     # Each pod uses a full spine-leaf mesh without bundling.
-    spines_per_pod = links_per_leaf   # = uplink_ports * leaf_to_spine_fanout
+    spines_per_pod = links_per_leaf  # = uplink_ports * leaf_to_spine_fanout
     pods_per_plane = math.ceil(leaves_per_plane / leaves_per_pod)
     spines_per_plane_3t = spines_per_pod * pods_per_plane
 
@@ -302,12 +375,16 @@ def design_fabric(inp: DesignInputs) -> DesignResult:
     spine_to_super_fanout, super_to_spine_fanout = _compute_fanouts(
         inp.spine_speed, inp.super_spine_speed
     )
-    total_spine_super_links = spines_per_plane_3t * spine_ports_up * spine_to_super_fanout
+    total_spine_super_links = (
+        spines_per_plane_3t * spine_ports_up * spine_to_super_fanout
+    )
     links_absorbed_per_super = inp.spine_ports * super_to_spine_fanout
-    super_spines_per_plane = max(1, math.ceil(
-        total_spine_super_links / links_absorbed_per_super
-    ))
-    ports_used_per_super = inp.spine_ports  # all super-spine ports used toward spine layer
+    super_spines_per_plane = max(
+        1, math.ceil(total_spine_super_links / links_absorbed_per_super)
+    )
+    ports_used_per_super = (
+        inp.spine_ports
+    )  # all super-spine ports used toward spine layer
 
     # Each spine should be able to reach at least `super_spines_per_plane`
     # super-spines (one link each) for path diversity; fewer works with
@@ -356,9 +433,9 @@ def design_fabric(inp: DesignInputs) -> DesignResult:
             f"port splits into {super_to_spine_fanout} x {inp.spine_speed}G "
             "spine-side links."
         )
-    links_per_spine_super_pair = max(
-        1, spine_reach // super_spines_per_plane
-    ) if super_spines_per_plane else 0
+    links_per_spine_super_pair = (
+        max(1, spine_reach // super_spines_per_plane) if super_spines_per_plane else 0
+    )
     notes.append(
         f"Super-spine sizing: {spines_per_plane_3t} spines x {spine_ports_up} "
         f"uplink ports = {total_spine_super_links} links absorbed by "
@@ -367,30 +444,45 @@ def design_fabric(inp: DesignInputs) -> DesignResult:
         f"(~{links_per_spine_super_pair} link(s) per spine-super pair)."
     )
 
-    _add_common_notes(notes, inp, leaf_breakout, leaf_to_spine_fanout,
-                      spine_to_leaf_fanout, downlink_ports, uplink_ports,
-                      gpus_per_leaf, num_planes)
+    _add_common_notes(
+        notes,
+        inp,
+        leaf_breakout,
+        leaf_to_spine_fanout,
+        spine_to_leaf_fanout,
+        downlink_ports,
+        uplink_ports,
+        gpus_per_leaf,
+        num_planes,
+    )
 
     return DesignResult(
-        inputs=inp, num_planes=num_planes, plane=plane,
+        inputs=inp,
+        num_planes=num_planes,
+        plane=plane,
         total_leaves=leaves_per_plane * num_planes,
         total_spines=spines_per_plane_3t * num_planes,
         total_super_spines=super_spines_per_plane * num_planes,
         total_nodes=math.ceil(inp.num_gpus / inp.gpus_per_node),
         cables=_compute_cables(inp, plane, num_planes),
-        notes=notes, feasible=feasible,
+        notes=notes,
+        feasible=feasible,
         topology="3-tier",
     )
 
 
-def _single_switch_result(inp: DesignInputs, num_planes: int,
-                          gpus_per_plane: int, leaf_breakout: int,
-                          notes: list[str]) -> DesignResult:
+def _single_switch_result(
+    inp: DesignInputs,
+    num_planes: int,
+    gpus_per_plane: int,
+    leaf_breakout: int,
+    notes: list[str],
+) -> DesignResult:
     """All GPU NICs in a plane fit on one leaf. No spine layer required."""
     downlink_ports_used = math.ceil(gpus_per_plane / leaf_breakout)
     plane = PlaneDesign(
         nic_speed_raw=inp.nic_speed,
-        nic_speed=inp.nic_speed // inp.plans_per_nic,
+        nic_speed=inp.nic_speed // max(1, inp.plans_per_nic),
         leaf_speed=inp.leaf_speed,
         spine_speed=inp.spine_speed,
         super_spine_speed=0,
@@ -409,12 +501,7 @@ def _single_switch_result(inp: DesignInputs, num_planes: int,
         spine_ports_used_for_leaves=0,
     )
 
-    leaf_to_nic_cables = _cable_count(inp.num_gpus, leaf_breakout, 1)
-    leaf_to_nic_label = _cable_label(inp.leaf_speed, leaf_breakout,
-                                     inp.nic_speed, 1)
-    cables = [
-        CableGroup(leaf_to_nic_cables, leaf_to_nic_label, "Leaf", "Node"),
-    ]
+    cables = _compute_cables(inp, plane, num_planes)
 
     notes.append(
         f"Single-switch (collapsed) design: {gpus_per_plane} GPU NICs per "
@@ -425,17 +512,26 @@ def _single_switch_result(inp: DesignInputs, num_planes: int,
     if leaf_breakout > 1:
         notes.append(
             f"Leaf-to-NIC breakout: each {inp.leaf_speed}G port splits into "
-            f"{leaf_breakout} x {inp.nic_speed // inp.plans_per_nic}G NIC links."
+            f"{leaf_breakout} x {inp.nic_speed // max(1, inp.plans_per_nic)}G NIC links."
         )
     if inp.plans_per_nic > 1:
         notes.append(
-            "Node-side NIC breakout is in use (plans per NIC > 1); a shuffle box is needed per node."
+            "Node-side NIC breakout is in use (plans per NIC > 1); a shuffle box might be needed per node."
+        )
+    elif inp.plans_per_nic == 0:
+        notes.append(
+            "Single-plan mode: all NICs per GPU are placed in one fabric (no per-NIC breakout plans)."
         )
     total_nodes = math.ceil(inp.num_gpus / inp.gpus_per_node)
+    nic_split_note = (
+        f"{inp.plans_per_nic} x {inp.nic_speed // max(1, inp.plans_per_nic)}G per NIC"
+        if inp.plans_per_nic > 0
+        else "single-plan mode (no per-NIC split)"
+    )
     notes.append(
         f"Nodes: {total_nodes} total (each with {inp.gpus_per_node} GPUs and "
         f"{inp.nics_per_gpu} x {inp.nic_speed}G NIC(s), split as "
-        f"{inp.plans_per_nic} x {inp.nic_speed // inp.plans_per_nic}G per NIC)."
+        f"{nic_split_note})."
     )
     if num_planes > 1:
         notes.append(
@@ -444,19 +540,23 @@ def _single_switch_result(inp: DesignInputs, num_planes: int,
         )
 
     return DesignResult(
-        inputs=inp, num_planes=num_planes, plane=plane,
+        inputs=inp,
+        num_planes=num_planes,
+        plane=plane,
         total_leaves=num_planes,
         total_spines=0,
         total_super_spines=0,
         total_nodes=total_nodes,
         cables=cables,
-        notes=notes, feasible=True,
+        notes=notes,
+        feasible=True,
         topology="single-switch",
     )
 
 
-def _compute_cables(inp: DesignInputs, plane: PlaneDesign,
-                    num_planes: int) -> list[CableGroup]:
+def _compute_cables(
+    inp: DesignInputs, plane: PlaneDesign, num_planes: int
+) -> list[CableGroup]:
     """Count physical cables per layer (summed across planes).
     Breakout cables count as one physical cable carrying N logical links.
     """
@@ -464,83 +564,268 @@ def _compute_cables(inp: DesignInputs, plane: PlaneDesign,
 
     # Leaf <-> Node (GPU NIC): one NIC link per GPU per plane
     if plane.leaves_per_plane > 0:
-        # GPU endpoints are partitioned across planes; total leaf<->node links
-        # therefore tracks total GPUs (not GPUs-per-plan multiplied by plans).
-        leaf_nic_links = inp.num_gpus
+        # In parallel-plan mode, GPU endpoints are partitioned across planes,
+        # so total links track total GPUs. In single-plan mode, all NICs are
+        # in one fabric and all NIC links must be cabled inside that plan.
+        leaf_nic_links = (
+            inp.num_gpus * inp.nics_per_gpu if inp.plans_per_nic == 0 else inp.num_gpus
+        )
         leaf_nic_count = _cable_count(leaf_nic_links, plane.leaf_breakout, 1)
-        cables.append(CableGroup(
-            count=leaf_nic_count,
-            label=_cable_label(plane.leaf_speed, plane.leaf_breakout,
-                               plane.nic_speed, 1),
-            end_a="Leaf", end_b="Node",
-        ))
+        cables.append(
+            CableGroup(
+                count=leaf_nic_count,
+                label=_cable_label(
+                    plane.leaf_speed, plane.leaf_breakout, plane.nic_speed, 1
+                ),
+                end_a="Leaf",
+                end_b="Node",
+            )
+        )
 
     # Spine <-> Leaf
     if plane.spines_per_plane > 0:
-        sl_links = (plane.leaves_per_plane * plane.uplink_ports_per_leaf
-                    * plane.leaf_to_spine_fanout)
-        sl_count = _cable_count(sl_links, plane.leaf_to_spine_fanout,
-                                plane.spine_to_leaf_fanout) * num_planes
-        cables.append(CableGroup(
-            count=sl_count,
-            label=_cable_label(plane.leaf_speed, plane.leaf_to_spine_fanout,
-                               plane.spine_speed, plane.spine_to_leaf_fanout),
-            end_a="Spine", end_b="Leaf",
-        ))
+        sl_links = (
+            plane.leaves_per_plane
+            * plane.uplink_ports_per_leaf
+            * plane.leaf_to_spine_fanout
+        )
+        sl_count = (
+            _cable_count(
+                sl_links, plane.leaf_to_spine_fanout, plane.spine_to_leaf_fanout
+            )
+            * num_planes
+        )
+        cables.append(
+            CableGroup(
+                count=sl_count,
+                label=_cable_label(
+                    plane.leaf_speed,
+                    plane.leaf_to_spine_fanout,
+                    plane.spine_speed,
+                    plane.spine_to_leaf_fanout,
+                ),
+                end_a="Spine",
+                end_b="Leaf",
+            )
+        )
 
     # Super-spine <-> Spine
     if plane.uses_super_spine and plane.super_spines_per_plane > 0:
-        ss_links = (plane.spines_per_plane * plane.spine_ports_up_to_super
-                    * plane.spine_to_super_fanout)
-        ss_count = _cable_count(ss_links, plane.spine_to_super_fanout,
-                                plane.super_to_spine_fanout) * num_planes
-        cables.append(CableGroup(
-            count=ss_count,
-            label=_cable_label(plane.spine_speed, plane.spine_to_super_fanout,
-                               plane.super_spine_speed, plane.super_to_spine_fanout),
-            end_a="Super-spine", end_b="Spine",
-        ))
+        ss_links = (
+            plane.spines_per_plane
+            * plane.spine_ports_up_to_super
+            * plane.spine_to_super_fanout
+        )
+        ss_count = (
+            _cable_count(
+                ss_links, plane.spine_to_super_fanout, plane.super_to_spine_fanout
+            )
+            * num_planes
+        )
+        cables.append(
+            CableGroup(
+                count=ss_count,
+                label=_cable_label(
+                    plane.spine_speed,
+                    plane.spine_to_super_fanout,
+                    plane.super_spine_speed,
+                    plane.super_to_spine_fanout,
+                ),
+                end_a="Super-spine",
+                end_b="Spine",
+            )
+        )
 
     return cables
 
 
+def build_bill_of_materials(result: DesignResult) -> BillOfMaterials:
+    """Layered BOM: switches (count + radix/speed) and cables (count + optic type label)."""
+    inp = result.inputs
+    plane = result.plane
+
+    def cable_groups_between(end_a: str, end_b: str) -> list[CableGroup]:
+        return [c for c in result.cables if c.end_a == end_a and c.end_b == end_b]
+
+    def lines_for(groups: list[CableGroup], hop_description: str) -> list[BOMCableLine]:
+        out: list[BOMCableLine] = []
+        for c in groups:
+            out.append(
+                BOMCableLine(
+                    quantity=c.count,
+                    specification=f"{c.label} — {hop_description}",
+                )
+            )
+        return out
+
+    leaf_groups = cable_groups_between("Leaf", "Node")
+    spine_to_leaf_groups = cable_groups_between("Spine", "Leaf")
+    super_to_spine_groups = cable_groups_between("Super-spine", "Spine")
+
+    leaf_switch_spec = f"{inp.leaf_ports}-port @ {_fmt_speed(inp.leaf_speed)}"
+    spine_switch_spec = f"{inp.spine_ports}-port @ {_fmt_speed(inp.spine_speed)}"
+    super_speed = plane.super_spine_speed
+    if result.total_super_spines == 0:
+        super_switch_spec = "Not used"
+    elif super_speed:
+        super_switch_spec = f"{inp.spine_ports}-port @ {_fmt_speed(super_speed)}"
+    else:
+        super_switch_spec = f"{inp.spine_ports}-port (speed unset)"
+
+    super_layer_note = ""
+    if result.total_super_spines == 0:
+        if result.topology == "3-tier" and plane.uses_super_spine:
+            super_layer_note = (
+                "Super-spine layer included in topology model but count is zero "
+                "or design marked infeasible; verify inputs."
+            )
+        else:
+            super_layer_note = "Super-spine not used for this design."
+
+    spine_layer_note = ""
+    if result.total_spines == 0:
+        if result.topology == "single-switch":
+            spine_layer_note = (
+                "Spine layer not required (collapsed single-switch / leaf-only)."
+            )
+        elif not result.feasible:
+            spine_layer_note = (
+                "Spine layer not sized — design infeasible with current inputs."
+            )
+        else:
+            spine_layer_note = "No spine switches in this result."
+
+    leaf_layer_note = ""
+    if result.total_leaves == 0 and not result.feasible:
+        leaf_layer_note = (
+            "Leaf layer not sized — design infeasible with current inputs."
+        )
+
+    # Shuffle boxes: multi-plane + NIC-side plan breakout (plans_per_nic > 1).
+    shuffle_qty = 0
+    shuffle_note = (
+        "No shuffle count is assumed in the BOM. If you use multiple parallel "
+        "planes with plans_per_nic > 1, shuffle assemblies might still be needed "
+        "for node-side fan-out; actual materials depend on cable and optic "
+        "choices, and many valid options exist."
+    )
+    if result.num_planes > 1 and inp.plans_per_nic > 1 and leaf_groups:
+        shuffle_qty = sum(c.count for c in leaf_groups)
+        shuffle_note = (
+            f"Multi-plane ({result.num_planes}) with NIC plan breakout "
+            f"(plans_per_nic={inp.plans_per_nic}): shuffle boxes might be needed "
+            f"for node-side fan-out into per-plan links. This model’s "
+            f"{shuffle_qty:,} leaf↔node cable(s) is only a planning hint tied to "
+            f"the breakout math above — not a firm order of materials, because "
+            f"real deployments depend on cable and optic choices and there are "
+            f"many options."
+        )
+
+    return BillOfMaterials(
+        super_spine=BOMLayer(
+            title="Super-spine",
+            switch_quantity=result.total_super_spines,
+            switch_specification=super_switch_spec,
+            cable_lines=lines_for(
+                super_to_spine_groups,
+                "super-spine ↔ spine (optics per cable label)",
+            ),
+            layer_note=super_layer_note,
+        ),
+        spine=BOMLayer(
+            title="Spine",
+            switch_quantity=result.total_spines,
+            switch_specification=spine_switch_spec,
+            cable_lines=lines_for(
+                spine_to_leaf_groups,
+                "spine ↔ leaf (optics per cable label)",
+            ),
+            layer_note=spine_layer_note,
+        ),
+        leaf=BOMLayer(
+            title="Leaf",
+            switch_quantity=result.total_leaves,
+            switch_specification=leaf_switch_spec,
+            cable_lines=lines_for(
+                leaf_groups,
+                "leaf ↔ compute node / NIC (optics per cable label)",
+            ),
+            layer_note=leaf_layer_note,
+        ),
+        shuffle_box_quantity=shuffle_qty,
+        shuffle_box_note=shuffle_note,
+    )
+
+
+def design_fabric(inp: DesignInputs) -> DesignResult:
+    result = _design_fabric_compute(inp)
+    result.bom = build_bill_of_materials(result)
+    return result
+
+
 def _infeasible(inp: DesignInputs, notes: list[str]) -> DesignResult:
     plane = PlaneDesign(
-        nic_speed=inp.nic_speed // max(1, inp.plans_per_nic), nic_speed_raw=inp.nic_speed,
+        nic_speed=inp.nic_speed // max(1, inp.plans_per_nic),
+        nic_speed_raw=inp.nic_speed,
         leaf_speed=inp.leaf_speed,
-        spine_speed=inp.spine_speed, super_spine_speed=inp.super_spine_speed,
-        leaf_breakout=0, leaf_to_spine_fanout=0, spine_to_leaf_fanout=0,
-        spine_to_super_fanout=0, super_to_spine_fanout=0,
-        downlink_ports_per_leaf=0, uplink_ports_per_leaf=0,
+        spine_speed=inp.spine_speed,
+        super_spine_speed=inp.super_spine_speed,
+        leaf_breakout=0,
+        leaf_to_spine_fanout=0,
+        spine_to_leaf_fanout=0,
+        spine_to_super_fanout=0,
+        super_to_spine_fanout=0,
+        downlink_ports_per_leaf=0,
+        uplink_ports_per_leaf=0,
         gpus_per_leaf=0,
-        gpus_per_plane=math.ceil(
-            inp.num_gpus / max(1, inp.plans_per_nic * inp.nics_per_gpu)
+        gpus_per_plane=(
+            inp.num_gpus * inp.nics_per_gpu
+            if inp.plans_per_nic == 0
+            else math.ceil(inp.num_gpus / max(1, inp.plans_per_nic * inp.nics_per_gpu))
         ),
-        leaves_per_plane=0, spines_per_plane=0,
-        links_per_leaf_to_each_spine=0, spine_ports_used_for_leaves=0,
+        leaves_per_plane=0,
+        spines_per_plane=0,
+        links_per_leaf_to_each_spine=0,
+        spine_ports_used_for_leaves=0,
     )
     return DesignResult(
         inputs=inp,
-        num_planes=inp.plans_per_nic * inp.nics_per_gpu,
+        num_planes=1
+        if inp.plans_per_nic == 0
+        else inp.plans_per_nic * inp.nics_per_gpu,
         plane=plane,
-        total_leaves=0, total_spines=0, total_super_spines=0,
+        total_leaves=0,
+        total_spines=0,
+        total_super_spines=0,
         total_nodes=math.ceil(inp.num_gpus / inp.gpus_per_node),
-        notes=notes, feasible=False,
+        notes=notes,
+        feasible=False,
     )
 
 
-def _add_common_notes(notes: list[str], inp: DesignInputs, leaf_breakout: int,
-                      leaf_to_spine_fanout: int, spine_to_leaf_fanout: int,
-                      downlink_ports: int, uplink_ports: int,
-                      gpus_per_leaf: int, num_planes: int) -> None:
+def _add_common_notes(
+    notes: list[str],
+    inp: DesignInputs,
+    leaf_breakout: int,
+    leaf_to_spine_fanout: int,
+    spine_to_leaf_fanout: int,
+    downlink_ports: int,
+    uplink_ports: int,
+    gpus_per_leaf: int,
+    num_planes: int,
+) -> None:
     if leaf_breakout > 1:
         notes.append(
             f"Leaf-to-NIC breakout: each {inp.leaf_speed}G leaf port splits "
-            f"into {leaf_breakout} x {inp.nic_speed // inp.plans_per_nic}G NIC links."
+            f"into {leaf_breakout} x {inp.nic_speed // max(1, inp.plans_per_nic)}G NIC links."
         )
     if inp.plans_per_nic > 1:
         notes.append(
-            "Node-side NIC breakout is in use (plans per NIC > 1); a shuffle box is needed per node."
+            "Node-side NIC breakout is in use (plans per NIC > 1); a shuffle box might be needed per node."
+        )
+    elif inp.plans_per_nic == 0:
+        notes.append(
+            "Single-plan mode: all NICs per GPU are placed in one fabric (no per-NIC breakout plans)."
         )
     if leaf_to_spine_fanout > 1:
         notes.append(
@@ -564,7 +849,7 @@ def _add_common_notes(notes: list[str], inp: DesignInputs, leaf_breakout: int,
     notes.append(
         f"Nodes: {total_nodes} total (each with {inp.gpus_per_node} GPUs and "
         f"{inp.nics_per_gpu} x {inp.nic_speed}G NIC(s), split as "
-        f"{inp.plans_per_nic} x {inp.nic_speed // inp.plans_per_nic}G per NIC)."
+        f"{f'{inp.plans_per_nic} x {inp.nic_speed // max(1, inp.plans_per_nic)}G per NIC' if inp.plans_per_nic > 0 else 'single-plan mode (no per-NIC split)'})."
     )
     if num_planes > 1:
         notes.append(
@@ -577,6 +862,7 @@ def _add_common_notes(notes: list[str], inp: DesignInputs, leaf_breakout: int,
 # SVG diagram
 # ---------------------------------------------------------------------------
 
+
 def _fmt_speed(gbps: int) -> str:
     if gbps >= 1000:
         v = gbps / 1000
@@ -588,8 +874,7 @@ def _fmt_speed(gbps: int) -> str:
 ELLIPSIS = object()
 
 
-def _slots(count: int, max_items: int = 9,
-           head: int = 5, tail: int = 3) -> list:
+def _slots(count: int, max_items: int = 9, head: int = 5, tail: int = 3) -> list:
     """Return a list of slots for drawing.
 
     If count <= max_items: returns [0, 1, ..., count-1]
@@ -616,12 +901,12 @@ def render_svg(result: DesignResult) -> str:
             '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 120">'
             '<text x="300" y="60" text-anchor="middle" fill="#b91c1c" '
             'font-family="sans-serif" font-size="16">'
-            'Design not feasible with given inputs.</text></svg>'
+            "Design not feasible with given inputs.</text></svg>"
         )
 
     width = 1260
     has_super = plane.uses_super_spine
-    single_switch = (result.topology == "single-switch")
+    single_switch = result.topology == "single-switch"
     # Row y-positions
     if has_super:
         super_y = 70
@@ -645,20 +930,20 @@ def render_svg(result: DesignResult) -> str:
     parts: list[str] = [
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" '
         f'font-family="Inter, system-ui, sans-serif" font-size="12">',
-        '<defs>'
+        "<defs>"
         '<linearGradient id="sspineGrad" x1="0" x2="0" y1="0" y2="1">'
         '<stop offset="0" stop-color="#4a1d96"/><stop offset="1" stop-color="#7c3aed"/>'
-        '</linearGradient>'
+        "</linearGradient>"
         '<linearGradient id="spineGrad" x1="0" x2="0" y1="0" y2="1">'
         '<stop offset="0" stop-color="#1e3a8a"/><stop offset="1" stop-color="#2563eb"/>'
-        '</linearGradient>'
+        "</linearGradient>"
         '<linearGradient id="leafGrad" x1="0" x2="0" y1="0" y2="1">'
         '<stop offset="0" stop-color="#065f46"/><stop offset="1" stop-color="#10b981"/>'
-        '</linearGradient>'
+        "</linearGradient>"
         '<linearGradient id="nodeGrad" x1="0" x2="0" y1="0" y2="1">'
         '<stop offset="0" stop-color="#7c2d12"/><stop offset="1" stop-color="#ea580c"/>'
-        '</linearGradient>'
-        '</defs>',
+        "</linearGradient>"
+        "</defs>",
     ]
 
     # Determine what to draw. In 3-tier we draw ONE pod of leaves/spines
@@ -694,10 +979,13 @@ def render_svg(result: DesignResult) -> str:
                 parts.append(
                     f'<line x1="{sx}" y1="{super_y + 36}" x2="{spx}" y2="{spine_y}" '
                     f'stroke="#a78bfa" stroke-width="1" opacity="0.6"'
-                    + (' stroke-dasharray="4 3"'
-                       if plane.spine_to_super_fanout > 1 or plane.super_to_spine_fanout > 1
-                       else '')
-                    + '/>'
+                    + (
+                        ' stroke-dasharray="4 3"'
+                        if plane.spine_to_super_fanout > 1
+                        or plane.super_to_spine_fanout > 1
+                        else ""
+                    )
+                    + "/>"
                 )
 
         # super-spine boxes / ellipsis
@@ -707,13 +995,13 @@ def render_svg(result: DesignResult) -> str:
                 continue
             label = f"S-Spine {slot + 1}"
             parts.append(
-                f'<rect x="{sx-64}" y="{super_y}" width="128" height="36" rx="6" '
+                f'<rect x="{sx - 64}" y="{super_y}" width="128" height="36" rx="6" '
                 f'fill="url(#sspineGrad)" stroke="#4a1d96"/>'
-                f'<text x="{sx}" y="{super_y+16}" text-anchor="middle" fill="white" '
+                f'<text x="{sx}" y="{super_y + 16}" text-anchor="middle" fill="white" '
                 f'font-weight="600">{label}</text>'
-                f'<text x="{sx}" y="{super_y+30}" text-anchor="middle" fill="#ddd6fe" '
+                f'<text x="{sx}" y="{super_y + 30}" text-anchor="middle" fill="#ddd6fe" '
                 f'font-size="11">{result.inputs.spine_ports}-port @ '
-                f'{_fmt_speed(plane.super_spine_speed)}</text>'
+                f"{_fmt_speed(plane.super_spine_speed)}</text>"
             )
 
     # ---------- Spine <-> leaf links --------------------------------------
@@ -740,13 +1028,13 @@ def render_svg(result: DesignResult) -> str:
                 parts.append(_ellipsis_dots(sx, spine_y + 18, "#1e3a8a"))
                 continue
             parts.append(
-                f'<rect x="{sx-62}" y="{spine_y}" width="124" height="36" rx="6" '
+                f'<rect x="{sx - 62}" y="{spine_y}" width="124" height="36" rx="6" '
                 f'fill="url(#spineGrad)" stroke="#1e3a8a"/>'
-                f'<text x="{sx}" y="{spine_y+16}" text-anchor="middle" fill="white" '
+                f'<text x="{sx}" y="{spine_y + 16}" text-anchor="middle" fill="white" '
                 f'font-weight="600">Spine {slot + 1}</text>'
-                f'<text x="{sx}" y="{spine_y+30}" text-anchor="middle" fill="#bfdbfe" '
+                f'<text x="{sx}" y="{spine_y + 30}" text-anchor="middle" fill="#bfdbfe" '
                 f'font-size="11">{result.inputs.spine_ports}-port @ '
-                f'{_fmt_speed(plane.spine_speed)}</text>'
+                f"{_fmt_speed(plane.spine_speed)}</text>"
             )
 
     # ---------- Leaf row --------------------------------------------------
@@ -755,13 +1043,13 @@ def render_svg(result: DesignResult) -> str:
             parts.append(_ellipsis_dots(lx, leaf_y + 18, "#065f46"))
             continue
         parts.append(
-            f'<rect x="{lx-62}" y="{leaf_y}" width="124" height="36" rx="6" '
+            f'<rect x="{lx - 62}" y="{leaf_y}" width="124" height="36" rx="6" '
             f'fill="url(#leafGrad)" stroke="#065f46"/>'
-            f'<text x="{lx}" y="{leaf_y+16}" text-anchor="middle" fill="white" '
+            f'<text x="{lx}" y="{leaf_y + 16}" text-anchor="middle" fill="white" '
             f'font-weight="600">Leaf {slot + 1}</text>'
-            f'<text x="{lx}" y="{leaf_y+30}" text-anchor="middle" fill="#a7f3d0" '
+            f'<text x="{lx}" y="{leaf_y + 30}" text-anchor="middle" fill="#a7f3d0" '
             f'font-size="11">{result.inputs.leaf_ports}-port @ '
-            f'{_fmt_speed(plane.leaf_speed)}</text>'
+            f"{_fmt_speed(plane.leaf_speed)}</text>"
         )
 
     # ---------- Node row --------------------------------------------------
@@ -771,10 +1059,13 @@ def render_svg(result: DesignResult) -> str:
     gpus_per_node = result.inputs.gpus_per_node
     drawn_leaf_count = sum(1 for s in leaf_slots if s is not ELLIPSIS) or 1
     real_nodes_per_leaf = max(1, math.ceil(plane.gpus_per_leaf / gpus_per_node))
-    nodes_per_leaf_draw = max(1, min(
-        real_nodes_per_leaf,
-        MAX_NODE_ICONS // drawn_leaf_count,
-    ))
+    nodes_per_leaf_draw = max(
+        1,
+        min(
+            real_nodes_per_leaf,
+            MAX_NODE_ICONS // drawn_leaf_count,
+        ),
+    )
     show_node_ellipsis = real_nodes_per_leaf > nodes_per_leaf_draw
     leaf_nic_dash = ' stroke-dasharray="4 3"' if plane.leaf_breakout > 1 else ""
 
@@ -792,12 +1083,12 @@ def render_svg(result: DesignResult) -> str:
                 f'stroke="#f97316" stroke-width="1.2"{leaf_nic_dash}/>'
                 f'<rect x="{nx}" y="{node_y}" width="82" height="50" rx="6" '
                 f'fill="url(#nodeGrad)" stroke="#7c2d12"/>'
-                f'<text x="{nx+41}" y="{node_y+16}" text-anchor="middle" fill="white" '
+                f'<text x="{nx + 41}" y="{node_y + 16}" text-anchor="middle" fill="white" '
                 f'font-weight="600">Node</text>'
-                f'<text x="{nx+41}" y="{node_y+32}" text-anchor="middle" fill="#fed7aa" '
+                f'<text x="{nx + 41}" y="{node_y + 32}" text-anchor="middle" fill="#fed7aa" '
                 f'font-size="11">{gpus_per_node} GPUs</text>'
-                f'<text x="{nx+41}" y="{node_y+46}" text-anchor="middle" fill="#fed7aa" '
-                f'font-size="10">{result.inputs.nics_per_gpu}x{_fmt_speed(result.inputs.nic_speed)} NIC ({result.inputs.plans_per_nic}x{_fmt_speed(plane.nic_speed)})</text>'
+                f'<text x="{nx + 41}" y="{node_y + 46}" text-anchor="middle" fill="#fed7aa" '
+                f'font-size="10">{result.inputs.nics_per_gpu}x{_fmt_speed(result.inputs.nic_speed)} NIC ({"single-plan" if result.inputs.plans_per_nic == 0 else f"{result.inputs.plans_per_nic}x{_fmt_speed(plane.nic_speed)}"})</text>'
             )
         if show_node_ellipsis:
             ex = start_x + nodes_per_leaf_draw * (82 + 6) + 41
@@ -806,15 +1097,15 @@ def render_svg(result: DesignResult) -> str:
     # ---------- Layer labels & annotations --------------------------------
     if has_super:
         parts.append(
-            f'<text x="20" y="{super_y+22}" fill="#4a1d96" font-weight="700">SUPER-SPINE</text>'
+            f'<text x="20" y="{super_y + 22}" fill="#4a1d96" font-weight="700">SUPER-SPINE</text>'
         )
     if not single_switch:
         parts.append(
-            f'<text x="20" y="{spine_y+22}" fill="#1e3a8a" font-weight="700">SPINE</text>'
+            f'<text x="20" y="{spine_y + 22}" fill="#1e3a8a" font-weight="700">SPINE</text>'
         )
     parts.append(
-        f'<text x="20" y="{leaf_y+22}" fill="#065f46" font-weight="700">LEAF</text>'
-        f'<text x="20" y="{node_y+24}" fill="#7c2d12" font-weight="700">NODES</text>'
+        f'<text x="20" y="{leaf_y + 22}" fill="#065f46" font-weight="700">LEAF</text>'
+        f'<text x="20" y="{node_y + 24}" fill="#7c2d12" font-weight="700">NODES</text>'
     )
 
     if has_super:
@@ -825,7 +1116,7 @@ def render_svg(result: DesignResult) -> str:
         elif plane.super_to_spine_fanout > 1:
             bk = f" (super-spine {plane.super_to_spine_fanout}:1 breakout)"
         parts.append(
-            f'<text x="{width/2}" y="{(super_y+spine_y)/2}" text-anchor="middle" '
+            f'<text x="{width / 2}" y="{(super_y + spine_y) / 2}" text-anchor="middle" '
             f'fill="#4a1d96">{_fmt_speed(e2e)} super-spine &#8596; spine{bk}</text>'
         )
 
@@ -838,43 +1129,45 @@ def render_svg(result: DesignResult) -> str:
         else:
             sl_note = ""
         parts.append(
-            f'<text x="{width/2}" y="{(spine_y+leaf_y)/2}" text-anchor="middle" '
+            f'<text x="{width / 2}" y="{(spine_y + leaf_y) / 2}" text-anchor="middle" '
             f'fill="#1e3a8a">{_fmt_speed(e2e_spine_leaf)} spine &#8596; leaf{sl_note}</text>'
         )
 
-    leaf_nic_note = f" (leaf {plane.leaf_breakout}:1 breakout)" if plane.leaf_breakout > 1 else ""
-    plan_note = f" &#183; plan 1 of {result.num_planes}" if result.num_planes > 1 else ""
+    leaf_nic_note = (
+        f" (leaf {plane.leaf_breakout}:1 breakout)" if plane.leaf_breakout > 1 else ""
+    )
+    plan_note = (
+        f" &#183; plan 1 of {result.num_planes}" if result.num_planes > 1 else ""
+    )
     parts.append(
-        f'<text x="{width/2}" y="{(leaf_y+node_y)/2 + 10}" text-anchor="middle" '
+        f'<text x="{width / 2}" y="{(leaf_y + node_y) / 2 + 10}" text-anchor="middle" '
         f'fill="#7c2d12">{_fmt_speed(plane.nic_speed)} to GPU NICs'
-        f'{leaf_nic_note}{plan_note}</text>'
+        f"{leaf_nic_note}{plan_note}</text>"
     )
 
     # Pod annotation for 3-tier
     if has_super and plane.pods_per_plane > 1:
         parts.append(
-            f'<text x="{width/2}" y="{leaf_y - 50}" text-anchor="middle" '
+            f'<text x="{width / 2}" y="{leaf_y - 50}" text-anchor="middle" '
             f'fill="#065f46" font-size="12" font-weight="600">'
-            f'Showing 1 of {plane.pods_per_plane} pods '
-            f'({plane.leaves_per_pod} leaves + {plane.spines_per_pod} spines each)'
-            f'</text>'
+            f"Showing 1 of {plane.pods_per_plane} pods "
+            f"({plane.leaves_per_pod} leaves + {plane.spines_per_pod} spines each)"
+            f"</text>"
         )
 
     # Bottom summary strip: counts + cables
     ss_part = (
-        f' &#183; {result.total_super_spines} super-spines'
-        if result.total_super_spines else ""
+        f" &#183; {result.total_super_spines} super-spines"
+        if result.total_super_spines
+        else ""
     )
-    sp_part = (
-        f' &#183; {result.total_spines} spines'
-        if result.total_spines else ""
-    )
+    sp_part = f" &#183; {result.total_spines} spines" if result.total_spines else ""
     parts.append(
-        f'<text x="{width/2}" y="{height - 36}" text-anchor="middle" '
+        f'<text x="{width / 2}" y="{height - 36}" text-anchor="middle" '
         f'fill="#334155" font-size="13" font-weight="600">'
-        f'{result.total_nodes} nodes &#183; {result.inputs.num_gpus} GPUs '
-        f'&#183; {result.total_leaves} leaves'
-        f'{sp_part}{ss_part} &#183; {result.num_planes} plan(s)</text>'
+        f"{result.total_nodes} nodes &#183; {result.inputs.num_gpus} GPUs "
+        f"&#183; {result.total_leaves} leaves"
+        f"{sp_part}{ss_part} &#183; {result.num_planes} plan(s)</text>"
     )
     if result.cables:
         cable_text = " &#183; ".join(
@@ -882,21 +1175,21 @@ def render_svg(result: DesignResult) -> str:
             for c in result.cables
         )
         parts.append(
-            f'<text x="{width/2}" y="{height - 14}" text-anchor="middle" '
+            f'<text x="{width / 2}" y="{height - 14}" text-anchor="middle" '
             f'fill="#475569" font-size="12">Cables: {cable_text}</text>'
         )
 
-    parts.append('</svg>')
+    parts.append("</svg>")
     return "".join(parts)
 
 
 def _ellipsis_dots(cx: float, cy: float, color: str) -> str:
     return (
         f'<g fill="{color}">'
-        f'<circle cx="{cx-12}" cy="{cy}" r="3"/>'
+        f'<circle cx="{cx - 12}" cy="{cy}" r="3"/>'
         f'<circle cx="{cx}" cy="{cy}" r="3"/>'
-        f'<circle cx="{cx+12}" cy="{cy}" r="3"/>'
-        '</g>'
+        f'<circle cx="{cx + 12}" cy="{cy}" r="3"/>'
+        "</g>"
     )
 
 
@@ -918,15 +1211,47 @@ DEFAULTS = dict(
 )
 
 
+def _build_plan_comparison(form: dict[str, int]) -> list[dict[str, str | int]]:
+    rows: list[dict[str, str | int]] = []
+    for plans_per_nic in (0, 1, 2, 4):
+        compare_form = dict(form)
+        compare_form["plans_per_nic"] = plans_per_nic
+        compare_input = DesignInputs(**compare_form)
+        compare_result = design_fabric(compare_input)
+        total_cables = sum(c.count for c in compare_result.cables)
+        cable_breakdown = (
+            ", ".join(
+                f"{c.end_a}-{c.end_b}: {c.count:,}" for c in compare_result.cables
+            )
+            or "-"
+        )
+        rows.append(
+            {
+                "plans_per_nic": plans_per_nic,
+                "feasible": "Yes" if compare_result.feasible else "No",
+                "topology": compare_result.topology,
+                "leaf_switches": compare_result.total_leaves,
+                "spine_switches": compare_result.total_spines,
+                "super_spine_switches": compare_result.total_super_spines,
+                "total_cables": total_cables,
+                "cable_breakdown": cable_breakdown,
+            }
+        )
+    return rows
+
+
 @app.route("/", methods=["GET", "POST"])
 def index():
     form = dict(DEFAULTS)
     result = None
     svg = None
     error = None
+    compare_rows = None
+    selected_action = "design"
 
     if request.method == "POST":
         try:
+            selected_action = request.form.get("action", "design")
             form = dict(
                 num_gpus=int(request.form["num_gpus"]),
                 gpus_per_node=int(request.form["gpus_per_node"]),
@@ -939,9 +1264,7 @@ def index():
                 super_spine_speed=int(request.form.get("super_spine_speed", 0)),
                 # Accept legacy name "plans" from older cached HTML
                 plans_per_nic=int(
-                    request.form.get("plans_per_nic")
-                    or request.form.get("plans")
-                    or 1
+                    request.form.get("plans_per_nic") or request.form.get("plans") or 1
                 ),
             )
             if form["num_gpus"] <= 0:
@@ -959,20 +1282,33 @@ def index():
             if form["spine_speed"] not in (400, 800, 1600):
                 raise ValueError("Spine port speed must be 400G, 800G or 1.6T.")
             if form["super_spine_speed"] not in (0, 800, 1600):
-                raise ValueError("Super-spine speed must be 800G or 1.6T (or disabled).")
-            if form["plans_per_nic"] not in (1, 2, 4):
-                raise ValueError("Plans per NIC must be 1, 2, or 4.")
-            if form["nic_speed"] % form["plans_per_nic"] != 0:
+                raise ValueError(
+                    "Super-spine speed must be 800G or 1.6T (or disabled)."
+                )
+            if form["plans_per_nic"] not in (0, 1, 2, 4):
+                raise ValueError("Plans per NIC must be 0, 1, 2, or 4.")
+            if (
+                form["plans_per_nic"] > 0
+                and form["nic_speed"] % form["plans_per_nic"] != 0
+            ):
                 raise ValueError("NIC speed must be divisible by plans per NIC.")
 
             inp = DesignInputs(**form)
             result = design_fabric(inp)
             svg = render_svg(result)
+            if selected_action == "compare":
+                compare_rows = _build_plan_comparison(form)
         except Exception as exc:  # noqa: BLE001
             error = str(exc)
 
     return render_template(
-        "index.html", form=form, result=result, svg=svg, error=error,
+        "index.html",
+        form=form,
+        result=result,
+        svg=svg,
+        error=error,
+        compare_rows=compare_rows,
+        selected_action=selected_action,
     )
 
 
@@ -980,7 +1316,7 @@ if __name__ == "__main__":
     host = "0.0.0.0"
     listening_port = "5000"
     debug = False
-    browser_only = "false"
+    browser_only = "False"
 
     def run_flask():
         app.run(
@@ -991,16 +1327,20 @@ if __name__ == "__main__":
             threaded=True,
         )
 
-    if browser_only == "true":
+    if browser_only == "True":
         app.run(host=host, port=listening_port, debug=debug, use_reloader=False)
     else:
         threading.Thread(target=run_flask, daemon=True).start()
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline:
             try:
-                urllib.request.urlopen(f"http://127.0.0.1:{listening_port}/", timeout=0.25)
+                urllib.request.urlopen(
+                    f"http://127.0.0.1:{listening_port}/", timeout=0.25
+                )
                 break
             except OSError:
                 time.sleep(0.05)
-        webview.create_window("AI Cable Calculator", f"http://127.0.0.1:{listening_port}")
+        webview.create_window(
+            "AI Cable Calculator", f"http://127.0.0.1:{listening_port}"
+        )
         webview.start()
