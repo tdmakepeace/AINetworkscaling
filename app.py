@@ -39,6 +39,7 @@ class DesignInputs:
     gpus_per_node: int
     nics_per_gpu: int  # 1, 2, 3 -> NICs per GPU
     spine_ports: int
+    super_spine_ports: int
     leaf_ports: int
     nic_speed: int  # 400 or 800
     leaf_speed: int  # 400, 800 or 1600
@@ -378,12 +379,12 @@ def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
     total_spine_super_links = (
         spines_per_plane_3t * spine_ports_up * spine_to_super_fanout
     )
-    links_absorbed_per_super = inp.spine_ports * super_to_spine_fanout
+    links_absorbed_per_super = inp.super_spine_ports * super_to_spine_fanout
     super_spines_per_plane = max(
         1, math.ceil(total_spine_super_links / links_absorbed_per_super)
     )
     ports_used_per_super = (
-        inp.spine_ports
+        inp.super_spine_ports
     )  # all super-spine ports used toward spine layer
 
     # Each spine should be able to reach at least `super_spines_per_plane`
@@ -414,7 +415,8 @@ def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
     notes.append(
         f"3-tier design: {pods_per_plane} pod(s) per plane, each pod with "
         f"{leaves_per_pod} leaves and {spines_per_pod} spines; "
-        f"{super_spines_per_plane} super-spines @ {inp.super_spine_speed}G."
+        f"{super_spines_per_plane} super-spines @ {inp.super_spine_speed}G "
+        f"with {inp.super_spine_ports} ports each."
     )
     notes.append(
         f"Each spine splits its {inp.spine_ports} ports as "
@@ -668,9 +670,9 @@ def build_bill_of_materials(result: DesignResult) -> BillOfMaterials:
     if result.total_super_spines == 0:
         super_switch_spec = "Not used"
     elif super_speed:
-        super_switch_spec = f"{inp.spine_ports}-port @ {_fmt_speed(super_speed)}"
+        super_switch_spec = f"{inp.super_spine_ports}-port @ {_fmt_speed(super_speed)}"
     else:
-        super_switch_spec = f"{inp.spine_ports}-port (speed unset)"
+        super_switch_spec = f"{inp.super_spine_ports}-port (speed unset)"
 
     super_layer_note = ""
     if result.total_super_spines == 0:
@@ -1000,7 +1002,7 @@ def render_svg(result: DesignResult) -> str:
                 f'<text x="{sx}" y="{super_y + 16}" text-anchor="middle" fill="white" '
                 f'font-weight="600">{label}</text>'
                 f'<text x="{sx}" y="{super_y + 30}" text-anchor="middle" fill="#ddd6fe" '
-                f'font-size="11">{result.inputs.spine_ports}-port @ '
+                f'font-size="11">{result.inputs.super_spine_ports}-port @ '
                 f"{_fmt_speed(plane.super_spine_speed)}</text>"
             )
 
@@ -1202,6 +1204,7 @@ DEFAULTS = dict(
     gpus_per_node=8,
     nics_per_gpu=1,
     spine_ports=64,
+    super_spine_ports=64,
     leaf_ports=64,
     nic_speed=400,
     leaf_speed=800,
@@ -1257,6 +1260,9 @@ def index():
                 gpus_per_node=int(request.form["gpus_per_node"]),
                 nics_per_gpu=int(request.form["nics_per_gpu"]),
                 spine_ports=int(request.form["spine_ports"]),
+                super_spine_ports=int(
+                    request.form.get("super_spine_ports", request.form["spine_ports"])
+                ),
                 leaf_ports=int(request.form["leaf_ports"]),
                 nic_speed=int(request.form["nic_speed"]),
                 leaf_speed=int(request.form["leaf_speed"]),
@@ -1273,7 +1279,11 @@ def index():
                 raise ValueError("GPUs per node must be positive.")
             if form["nics_per_gpu"] not in (1, 2, 3):
                 raise ValueError("NICs per GPU must be 1, 2 or 3.")
-            if form["spine_ports"] <= 1 or form["leaf_ports"] <= 1:
+            if (
+                form["spine_ports"] <= 1
+                or form["super_spine_ports"] <= 1
+                or form["leaf_ports"] <= 1
+            ):
                 raise ValueError("Port counts must be > 1.")
             if form["nic_speed"] not in (400, 800):
                 raise ValueError("NIC speed must be 400G or 800G.")
