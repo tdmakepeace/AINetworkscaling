@@ -502,13 +502,19 @@
         </div>
       </div>
 
-      <div class="field">
-        <label for="super_spine_speed">Super-spine (used only if needed)</label>
-        <select id="super_spine_speed" name="super_spine_speed">
-          <option value="0" {% if form.super_spine_speed == 0 %}selected{% endif %}>Not used</option>
-          <option value="800" {% if form.super_spine_speed == 800 %}selected{% endif %}>Enable at 800G</option>
-          <option value="1600" {% if form.super_spine_speed == 1600 %}selected{% endif %}>Enable at 1.6T</option>
-        </select>
+      <div class="row">
+        <div class="field">
+          <label for="super_spine_speed">Super-spine (used only if needed)</label>
+          <select id="super_spine_speed" name="super_spine_speed">
+            <option value="0" {% if form.super_spine_speed == 0 %}selected{% endif %}>Not used</option>
+            <option value="800" {% if form.super_spine_speed == 800 %}selected{% endif %}>Enable at 800G</option>
+            <option value="1600" {% if form.super_spine_speed == 1600 %}selected{% endif %}>Enable at 1.6T</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="super_spine_ports">Ports per super-spine switch</label>
+          <input id="super_spine_ports" name="super_spine_ports" type="number" min="2" value="{{ form.super_spine_ports }}" required />
+        </div>
       </div>
 
       <p style="font-size: 12px; color: var(--muted); margin: -4px 0 10px;">
@@ -741,6 +747,10 @@
             {% endfor %}
           </tbody>
         </table>
+        <p>
+          <span style="color: red;">Where Multiplane are considered, Shuffle boxes might be needed. or breakout cables might be used.</span> <br>
+          <span style="color: red;">Any design must be validated with your network vendor of choice to make sure cable and optic options are supported.</span> <br>
+         </p>
       </div>
     </div>
   </div>
@@ -772,7 +782,9 @@
 
   <footer>
     <strong>Model assumptions:</strong> classic spine-leaf (and optional super-spine), 1:1 subscription where stated.
-    <b>Plans per NIC</b> defines NIC port breakout and total plans, multiplied by <b>NICs per GPU</b>.
+    <b>Plans per NIC</b> defines NIC port breakout and total plans, multiplied by <b>NICs per GPU</b>. <br>
+    <b><span style="color: red;">This tool only calculates the fabric design based on maths, it does not take into account the physical constraints of the switches and cables.</span></b> <br>
+    <b><span style="color: red;">Any design should be put together with the GPU and the networking teams.</span></b> <br>
     <div class="footer-disclaimer">
       Visual styling references the look and feel of
       <a href="https://www.amd.com/" target="_blank" rel="noopener noreferrer">amd.com</a>
