@@ -55,6 +55,33 @@ Dependencies are listed in `requirements.txt` (Flask, pywebview).
 pip install -r requirements.txt
 ```
 
+### Run with Docker
+
+1. Build the container image:
+
+```bash
+docker build -t ainetwork-designer .
+```
+
+2. Run the container and publish the app port:
+
+```bash
+docker run --rm -p 10000:10000 --name ainetwork-designer ainetwork-designer
+```
+
+3. Open the app in your browser:
+
+`http://localhost:10000/`
+
+4. Stop the app:
+
+- Press `Ctrl+C` in the terminal running the container.
+
+Optional:
+
+- Run detached: `docker run -d -p 10000:10000 --name ainetwork-designer ainetwork-designer`
+- Stop detached container: `docker stop ainetwork-designer`
+
 ### Windows
 
 **Option A — packaged executable**
