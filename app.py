@@ -45,7 +45,8 @@ class DesignInputs:
     leaf_speed: int  # 400, 800 or 1600
     spine_speed: int  # 400, 800 or 1600
     super_spine_speed: int = 0  # 0 = not used, else 800 or 1600
-    plans_per_nic: int = 1  # 0, 1, 2, or 4; 0 = all NICs in one plan
+    plans_per_nic: int = 0  # 0, 1, 2, or 4; 0 = all NICs in one plan
+    rail_design: bool = False
 
 
 @dataclass
@@ -243,6 +244,13 @@ def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
 
     gpus_per_leaf = downlink_ports * leaf_breakout
     leaves_per_plane = math.ceil(gpus_per_plane / gpus_per_leaf)
+    if inp.rail_design:
+        rail_multiple = inp.gpus_per_node
+        leaves_per_plane = math.ceil(leaves_per_plane / rail_multiple) * rail_multiple
+        notes.append(
+            f"Rail design enabled: leaves per plan are rounded up to a multiple of GPUs per node "
+            f"({inp.gpus_per_node}); using {leaves_per_plane} leaves/plan."
+        )
 
     # --- 2-tier sizing (first-pass) -------------------------------------
     links_per_leaf = uplink_ports * leaf_to_spine_fanout
@@ -1210,7 +1218,8 @@ DEFAULTS = dict(
     leaf_speed=800,
     spine_speed=800,
     super_spine_speed=0,
-    plans_per_nic=1,
+    plans_per_nic=0,
+    rail_design=False,
 )
 
 
@@ -1270,8 +1279,9 @@ def index():
                 super_spine_speed=int(request.form.get("super_spine_speed", 0)),
                 # Accept legacy name "plans" from older cached HTML
                 plans_per_nic=int(
-                    request.form.get("plans_per_nic") or request.form.get("plans") or 1
+                    request.form.get("plans_per_nic") or request.form.get("plans") or 0
                 ),
+                rail_design=request.form.get("rail_design") == "on",
             )
             if form["num_gpus"] <= 0:
                 raise ValueError("Number of GPUs must be positive.")
