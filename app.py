@@ -1335,8 +1335,8 @@ def index():
 if __name__ == "__main__":
     host = "0.0.0.0"
     listening_port = "5000"
-    debug = True
-    browser_only = "True"
+    debug = False
+    browser_only = "False"
 
     def run_flask():
         app.run(
