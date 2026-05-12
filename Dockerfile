@@ -1,7 +1,13 @@
 # AI Spine-Leaf Network Designer container image.
-# Build: docker build -t ainetwork-designer .
-# Run:   docker run --rm -p 10000:10000 ainetwork-designer
-# Open:  http://localhost:10000/
+# Serves Flask on port 10000 (no pywebview in-container).
+#
+# Docker:
+#   docker build -t ainetwork-designer .
+#   docker run --rm -p 10000:10000 --name ainetwork-designer ainetwork-designer
+# Podman (equivalent):
+#   podman build -t ainetwork-designer .
+#   podman run --rm -p 10000:10000 --name ainetwork-designer ainetwork-designer
+# Open: http://localhost:10000/
 
 FROM python:3.12-slim AS builder
 
@@ -29,6 +35,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 COPY --from=builder /opt/venv /opt/venv
 COPY app.py .
 COPY templates/ templates/
+COPY static/ static/
 
 EXPOSE 10000
 

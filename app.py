@@ -21,7 +21,9 @@ import time
 import urllib.request
 import math
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Literal, Optional
+
+DiagramZoomMode = Literal["fit", "detail"]
 
 from flask import Flask, render_template, request
 
@@ -67,6 +69,7 @@ class PlaneDesign:
     downlink_ports_per_leaf: int
     uplink_ports_per_leaf: int
     gpus_per_leaf: int
+    # Logical GPU uplinks sized per plane (multi-plan: every GPU is in every plan).
     gpus_per_plane: int
     leaves_per_plane: int
 
@@ -195,12 +198,12 @@ def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
             + ["Leaf port speed must be >= NIC speed and an integer multiple of it."],
         )
 
-    # Distribute endpoints across parallel fabrics first, then size each.
-    # In single-plan mode (plans_per_nic=0), all NICs stay in one fabric.
+    # Single-plan: one fabric carries every NIC link. Multi-plan: parallel
+    # physical fabrics; each GPU still appears in every plan (NIC breakout legs).
     gpus_per_plane = (
         inp.num_gpus * inp.nics_per_gpu
         if single_plan_mode
-        else math.ceil(inp.num_gpus / num_planes)
+        else inp.num_gpus
     )
 
     # Breakouts
@@ -222,8 +225,9 @@ def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
             f"{inp.plans_per_nic} x {inp.nics_per_gpu} = {num_planes} plan(s). "
             f"NIC breakout per GPU NIC: 1x{inp.nic_speed}G -> "
             f"{inp.plans_per_nic}x{nic_plan_speed}G. "
-            f"GPUs split before sizing: {inp.num_gpus} total / {num_planes} = "
-            f"{gpus_per_plane} GPUs per plan (rounded up)."
+            f"Every GPU is present in every plan at {nic_plan_speed}G on that plan's leg "
+            f"({gpus_per_plane} GPU uplinks per plan for fabric sizing — parallel fabrics, "
+            f"not a partition of the GPU fleet across plans)."
         )
 
     # --- Single-switch short-circuit ------------------------------------
@@ -545,8 +549,8 @@ def _single_switch_result(
     )
     if num_planes > 1:
         notes.append(
-            f"Totals are {num_planes} x per-plan counts "
-            "(one independent collapsed leaf per plan)."
+            f"Totals are {num_planes} x per-plan counts (one collapsed leaf per plan). "
+            f"Each plan is a separate fabric, but all {inp.num_gpus} GPUs attach to each."
         )
 
     return DesignResult(
@@ -572,15 +576,15 @@ def _compute_cables(
     """
     cables: list[CableGroup] = []
 
-    # Leaf <-> Node (GPU NIC): one NIC link per GPU per plane
+    # Leaf <-> Node (GPU NIC): per plane, one logical uplink per GPU per NIC leg
+    # in multi-plan mode; summed across planes for total cabling.
     if plane.leaves_per_plane > 0:
-        # In parallel-plan mode, GPU endpoints are partitioned across planes,
-        # so total links track total GPUs. In single-plan mode, all NICs are
-        # in one fabric and all NIC links must be cabled inside that plan.
-        leaf_nic_links = (
+        leaf_nic_links_per_plane = (
             inp.num_gpus * inp.nics_per_gpu if inp.plans_per_nic == 0 else inp.num_gpus
         )
-        leaf_nic_count = _cable_count(leaf_nic_links, plane.leaf_breakout, 1)
+        leaf_nic_count = (
+            _cable_count(leaf_nic_links_per_plane, plane.leaf_breakout, 1) * num_planes
+        )
         cables.append(
             CableGroup(
                 count=leaf_nic_count,
@@ -791,7 +795,7 @@ def _infeasible(inp: DesignInputs, notes: list[str]) -> DesignResult:
         gpus_per_plane=(
             inp.num_gpus * inp.nics_per_gpu
             if inp.plans_per_nic == 0
-            else math.ceil(inp.num_gpus / max(1, inp.plans_per_nic * inp.nics_per_gpu))
+            else inp.num_gpus
         ),
         leaves_per_plane=0,
         spines_per_plane=0,
@@ -863,8 +867,9 @@ def _add_common_notes(
     )
     if num_planes > 1:
         notes.append(
-            f"Totals are {num_planes} x per-plan counts "
-            "(one independent fabric per plan)."
+            f"Totals are {num_planes} x per-plan counts (parallel physical fabrics). "
+            f"Every GPU is in every plan at {inp.nic_speed // inp.plans_per_nic}G per plan leg "
+            f"from NIC breakout — not fewer GPUs per plan."
         )
 
 
@@ -895,6 +900,15 @@ def _slots(count: int, max_items: int = 9, head: int = 5, tail: int = 3) -> list
     return list(range(head)) + [ELLIPSIS] + list(range(count - tail, count))
 
 
+def _slots_for_zoom(count: int, zoom: DiagramZoomMode) -> list:
+    """Detail mode uses ellipsis for large counts; fit mode lists every index."""
+    if count <= 0:
+        return []
+    if zoom == "fit":
+        return list(range(count))
+    return _slots(count)
+
+
 def _xs(n: int, width: int, margin: int = 90) -> list[float]:
     if n == 0:
         return []
@@ -904,7 +918,49 @@ def _xs(n: int, width: int, margin: int = 90) -> list[float]:
     return [margin + i * step for i in range(n)]
 
 
-def render_svg(result: DesignResult) -> str:
+# Layer labels sit just left of row graphics; reserve horizontal space so
+# text (esp. "SUPER-SPINE") does not overlap rects and is not clipped.
+_DIAGRAM_MAX_NODE_ICONS = 24
+_LAYER_LABEL_GAP = 12.0
+_LAYER_LABEL_EST_WIDTH = 128.0
+
+
+def _layer_label_anchor_x(content_left_edge: float) -> float:
+    return content_left_edge - _LAYER_LABEL_GAP
+
+
+def _rail_line_segments(
+    ax: float,
+    ay: float,
+    bx: float,
+    by: float,
+    split_x: Optional[float],
+) -> list[tuple[float, float, float, float, float]]:
+    """Return (x1, y1, x2, y2, opacity) segments; fade after crossing split_x."""
+    if split_x is None or abs(bx - ax) < 1e-9:
+        return [(ax, ay, bx, by, 0.92)]
+    lo, hi = (ax, bx) if ax <= bx else (bx, ax)
+    if not (lo + 1e-6 < split_x < hi - 1e-6):
+        return [(ax, ay, bx, by, 0.92)]
+    t = (split_x - ax) / (bx - ax)
+    if t <= 1e-6 or t >= 1.0 - 1e-6:
+        return [(ax, ay, bx, by, 0.92)]
+    sx = ax + t * (bx - ax)
+    sy = ay + t * (by - ay)
+    return [(ax, ay, sx, sy, 0.92), (sx, sy, bx, by, 0.16)]
+
+
+def _rail_ellipsis_fan_offsets(count: int, spread: float = 22.0) -> list[float]:
+    """Horizontal offsets so multiple rail lines to the '...' slot do not stack."""
+    if count <= 0:
+        return []
+    if count == 1:
+        return [0.0]
+    half = spread / 2
+    return [half * (2 * i / (count - 1) - 1) for i in range(count)]
+
+
+def render_svg(result: DesignResult, diagram_zoom: DiagramZoomMode = "detail") -> str:
     plane = result.plane
     if not result.feasible or plane.leaves_per_plane == 0:
         return (
@@ -937,9 +993,138 @@ def render_svg(result: DesignResult) -> str:
         node_y = 470
         height = 620
 
+    # Determine what to draw. In 3-tier we draw ONE pod of leaves/spines
+    # plus the super-spine row, with ellipsis to indicate more pods.
+    if has_super:
+        draw_leaves_count = plane.leaves_per_pod
+        draw_spines_count = plane.spines_per_pod
+    elif single_switch:
+        draw_leaves_count = 1
+        draw_spines_count = 0
+    else:
+        draw_leaves_count = plane.leaves_per_plane
+        draw_spines_count = plane.spines_per_plane
+
+    zoom_fit = diagram_zoom == "fit"
+
+    spine_slots = _slots_for_zoom(draw_spines_count, diagram_zoom) if draw_spines_count else []
+    leaf_slots = _slots_for_zoom(draw_leaves_count, diagram_zoom)
+
+    spine_xs = _xs(len(spine_slots), width)
+    leaf_xs = _xs(len(leaf_slots), width)
+
+    sspine_slots: list = []
+    sspine_xs: list[float] = []
+    if has_super:
+        sspine_slots = _slots_for_zoom(plane.super_spines_per_plane, diagram_zoom)
+        sspine_xs = _xs(len(sspine_slots), width)
+
+    def _row_step(xs: list[float]) -> float:
+        if len(xs) <= 1:
+            return 120.0
+        return xs[1] - xs[0]
+
+    step_leaf = _row_step(leaf_xs)
+    step_spine = _row_step(spine_xs) if spine_xs else 120.0
+    step_ss = _row_step(sspine_xs) if sspine_xs else 120.0
+
+    if zoom_fit:
+        fs = 8
+        fs_sm = 7
+        fs_mid = 8
+        fs_bot = 9
+        fs_cable = 7
+        spine_hw = min(62.0, max(10.0, step_spine * 0.38))
+        leaf_hw = min(62.0, max(10.0, step_leaf * 0.38))
+        ss_hw = min(64.0, max(10.0, step_ss * 0.38))
+        spine_hh = max(14.0, 36.0 * (spine_hw / 62.0))
+        leaf_hh = max(14.0, 36.0 * (leaf_hw / 62.0))
+        ss_hh = max(14.0, 36.0 * (ss_hw / 64.0))
+        node_w = min(82.0, max(20.0, step_leaf * 0.78))
+        node_h = max(14.0, min(50.0, node_w * 0.55))
+        node_gap = max(2.0, 6.0 * (node_w / 82.0))
+        ell_r = 2.0
+    else:
+        fs = 12
+        fs_sm = 11
+        fs_mid = 12
+        fs_bot = 13
+        fs_cable = 12
+        spine_hw = 62.0
+        leaf_hw = 62.0
+        ss_hw = 64.0
+        spine_hh = 36.0
+        leaf_hh = 36.0
+        ss_hh = 36.0
+        node_w = 82.0
+        node_h = 50.0
+        node_gap = 6.0
+        ell_r = 3.0
+
+    # Keep link strokes and opacity aligned with detail view so fit mode stays vivid.
+    stroke_super = 1.0
+    stroke_spine_leaf = 1.0
+    stroke_leaf_node = 1.2
+    link_op_super = 0.95 if zoom_fit else 0.6
+    link_op_sl = 0.95 if zoom_fit else 0.7
+
+    spine_rect_w = spine_hw * 2
+    leaf_rect_w = leaf_hw * 2
+    ss_rect_w = ss_hw * 2
+    box_rx = min(6.0, max(2.0, leaf_hh * 0.17))
+
+    # Node row geometry (needed for viewBox + layer labels before `parts`).
+    gpus_per_node = result.inputs.gpus_per_node
+    drawn_leaf_count = sum(1 for s in leaf_slots if s is not ELLIPSIS) or 1
+    real_nodes_per_leaf = max(1, math.ceil(plane.gpus_per_leaf / gpus_per_node))
+    if zoom_fit:
+        node_nic_cap = max(6, min(real_nodes_per_leaf, max(1, 5200 // drawn_leaf_count)))
+    else:
+        node_nic_cap = _DIAGRAM_MAX_NODE_ICONS // drawn_leaf_count
+    nodes_per_leaf_draw = max(1, min(real_nodes_per_leaf, node_nic_cap))
+    show_node_ellipsis = real_nodes_per_leaf > nodes_per_leaf_draw
+    leaf_nic_dash = ' stroke-dasharray="4 3"' if plane.leaf_breakout > 1 else ""
+
+    min_node_row_left = float(width)
+    for slot, lx in zip(leaf_slots, leaf_xs):
+        if slot is ELLIPSIS:
+            continue
+        slots_in_group = nodes_per_leaf_draw + (1 if show_node_ellipsis else 0)
+        group_width = node_w * slots_in_group + node_gap * (slots_in_group - 1)
+        start_x = lx - group_width / 2
+        min_node_row_left = min(min_node_row_left, start_x)
+    if min_node_row_left >= float(width):
+        min_node_row_left = 90.0
+
+    label_rights: list[float] = []
+    if has_super and sspine_xs:
+        label_rights.append(_layer_label_anchor_x(min(sspine_xs) - ss_hw))
+    if not single_switch and spine_xs:
+        label_rights.append(_layer_label_anchor_x(min(spine_xs) - spine_hw))
+    if leaf_xs:
+        label_rights.append(_layer_label_anchor_x(min(leaf_xs) - leaf_hw))
+    label_rights.append(_layer_label_anchor_x(min_node_row_left))
+
+    vb_x0 = 0.0
+    if label_rights:
+        vb_x0 = min(0.0, min(label_rights) - _LAYER_LABEL_EST_WIDTH)
+    vb_x0_i = int(math.floor(vb_x0))
+    view_w = width - vb_x0_i
+
+    super_label_rx = (
+        _layer_label_anchor_x(min(sspine_xs) - ss_hw) if (has_super and sspine_xs) else None
+    )
+    spine_label_rx = (
+        _layer_label_anchor_x(min(spine_xs) - spine_hw)
+        if (not single_switch and spine_xs)
+        else None
+    )
+    leaf_label_rx = _layer_label_anchor_x(min(leaf_xs) - leaf_hw) if leaf_xs else None
+    nodes_label_rx = _layer_label_anchor_x(min_node_row_left)
+
     parts: list[str] = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" '
-        f'font-family="Inter, system-ui, sans-serif" font-size="12">',
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{vb_x0_i} 0 {view_w} {height}" '
+        f'font-family="Inter, system-ui, sans-serif" font-size="{fs}">',
         "<defs>"
         '<linearGradient id="sspineGrad" x1="0" x2="0" y1="0" y2="1">'
         '<stop offset="0" stop-color="#4a1d96"/><stop offset="1" stop-color="#7c3aed"/>'
@@ -956,29 +1141,8 @@ def render_svg(result: DesignResult) -> str:
         "</defs>",
     ]
 
-    # Determine what to draw. In 3-tier we draw ONE pod of leaves/spines
-    # plus the super-spine row, with ellipsis to indicate more pods.
-    if has_super:
-        draw_leaves_count = plane.leaves_per_pod
-        draw_spines_count = plane.spines_per_pod
-    elif single_switch:
-        draw_leaves_count = 1
-        draw_spines_count = 0
-    else:
-        draw_leaves_count = plane.leaves_per_plane
-        draw_spines_count = plane.spines_per_plane
-
-    spine_slots = _slots(draw_spines_count) if draw_spines_count else []
-    leaf_slots = _slots(draw_leaves_count)
-
-    spine_xs = _xs(len(spine_slots), width)
-    leaf_xs = _xs(len(leaf_slots), width)
-
     # ---------- Super-spine row -------------------------------------------
     if has_super:
-        sspine_slots = _slots(plane.super_spines_per_plane)
-        sspine_xs = _xs(len(sspine_slots), width)
-
         # spine <-> super-spine links
         for sx_idx, sx in enumerate(sspine_xs):
             if sspine_slots[sx_idx] is ELLIPSIS:
@@ -987,8 +1151,8 @@ def render_svg(result: DesignResult) -> str:
                 if spine_slots[sp_idx] is ELLIPSIS:
                     continue
                 parts.append(
-                    f'<line x1="{sx}" y1="{super_y + 36}" x2="{spx}" y2="{spine_y}" '
-                    f'stroke="#a78bfa" stroke-width="1" opacity="0.6"'
+                    f'<line x1="{sx}" y1="{super_y + ss_hh}" x2="{spx}" y2="{spine_y}" '
+                    f'stroke="#a78bfa" stroke-width="{stroke_super}" opacity="{link_op_super}"'
                     + (
                         ' stroke-dasharray="4 3"'
                         if plane.spine_to_super_fanout > 1
@@ -1001,16 +1165,18 @@ def render_svg(result: DesignResult) -> str:
         # super-spine boxes / ellipsis
         for slot, sx in zip(sspine_slots, sspine_xs):
             if slot is ELLIPSIS:
-                parts.append(_ellipsis_dots(sx, super_y + 18, "#4a1d96"))
+                parts.append(_ellipsis_dots(sx, super_y + ss_hh / 2, "#4a1d96", ell_r))
                 continue
-            label = f"S-Spine {slot + 1}"
+            label = f"S{slot + 1}" if zoom_fit else f"S-Spine {slot + 1}"
+            ty1 = super_y + ss_hh * 0.44
+            ty2 = super_y + ss_hh * 0.82
             parts.append(
-                f'<rect x="{sx - 64}" y="{super_y}" width="128" height="36" rx="6" '
-                f'fill="url(#sspineGrad)" stroke="#4a1d96"/>'
-                f'<text x="{sx}" y="{super_y + 16}" text-anchor="middle" fill="white" '
-                f'font-weight="600">{label}</text>'
-                f'<text x="{sx}" y="{super_y + 30}" text-anchor="middle" fill="#ddd6fe" '
-                f'font-size="11">{result.inputs.super_spine_ports}-port @ '
+                f'<rect x="{sx - ss_hw}" y="{super_y}" width="{ss_rect_w}" height="{ss_hh}" '
+                f'rx="{box_rx}" fill="url(#sspineGrad)" stroke="#4a1d96"/>'
+                f'<text x="{sx}" y="{ty1}" text-anchor="middle" fill="white" '
+                f'font-weight="600" font-size="{fs}">{label}</text>'
+                f'<text x="{sx}" y="{ty2}" text-anchor="middle" fill="#ddd6fe" '
+                f'font-size="{fs_sm}">{result.inputs.super_spine_ports}-p @ '
                 f"{_fmt_speed(plane.super_spine_speed)}</text>"
             )
 
@@ -1028,94 +1194,116 @@ def render_svg(result: DesignResult) -> str:
                 if leaf_slots[lf_idx] is ELLIPSIS:
                     continue
                 parts.append(
-                    f'<line x1="{spx}" y1="{spine_y + 36}" x2="{lx}" y2="{leaf_y}" '
-                    f'stroke="#60a5fa" stroke-width="1" opacity="0.7"{sl_dash}/>'
+                    f'<line x1="{spx}" y1="{spine_y + spine_hh}" x2="{lx}" y2="{leaf_y}" '
+                    f'stroke="#60a5fa" stroke-width="{stroke_spine_leaf}" opacity="{link_op_sl}"{sl_dash}/>'
                 )
 
         # ---------- Spine row ---------------------------------------------
         for slot, sx in zip(spine_slots, spine_xs):
             if slot is ELLIPSIS:
-                parts.append(_ellipsis_dots(sx, spine_y + 18, "#1e3a8a"))
+                parts.append(_ellipsis_dots(sx, spine_y + spine_hh / 2, "#1e3a8a", ell_r))
                 continue
+            sty1 = spine_y + spine_hh * 0.44
+            sty2 = spine_y + spine_hh * 0.82
+            sp_lbl = f"Sp{slot + 1}" if zoom_fit else f"Spine {slot + 1}"
             parts.append(
-                f'<rect x="{sx - 62}" y="{spine_y}" width="124" height="36" rx="6" '
-                f'fill="url(#spineGrad)" stroke="#1e3a8a"/>'
-                f'<text x="{sx}" y="{spine_y + 16}" text-anchor="middle" fill="white" '
-                f'font-weight="600">Spine {slot + 1}</text>'
-                f'<text x="{sx}" y="{spine_y + 30}" text-anchor="middle" fill="#bfdbfe" '
-                f'font-size="11">{result.inputs.spine_ports}-port @ '
+                f'<rect x="{sx - spine_hw}" y="{spine_y}" width="{spine_rect_w}" height="{spine_hh}" '
+                f'rx="{box_rx}" fill="url(#spineGrad)" stroke="#1e3a8a"/>'
+                f'<text x="{sx}" y="{sty1}" text-anchor="middle" fill="white" '
+                f'font-weight="600" font-size="{fs}">{sp_lbl}</text>'
+                f'<text x="{sx}" y="{sty2}" text-anchor="middle" fill="#bfdbfe" '
+                f'font-size="{fs_sm}">{result.inputs.spine_ports}-p @ '
                 f"{_fmt_speed(plane.spine_speed)}</text>"
             )
 
     # ---------- Leaf row --------------------------------------------------
     for slot, lx in zip(leaf_slots, leaf_xs):
         if slot is ELLIPSIS:
-            parts.append(_ellipsis_dots(lx, leaf_y + 18, "#065f46"))
+            parts.append(_ellipsis_dots(lx, leaf_y + leaf_hh / 2, "#065f46", ell_r))
             continue
+        lty1 = leaf_y + leaf_hh * 0.44
+        lty2 = leaf_y + leaf_hh * 0.82
+        lf_lbl = f"Lf{slot + 1}" if zoom_fit else f"Leaf {slot + 1}"
         parts.append(
-            f'<rect x="{lx - 62}" y="{leaf_y}" width="124" height="36" rx="6" '
-            f'fill="url(#leafGrad)" stroke="#065f46"/>'
-            f'<text x="{lx}" y="{leaf_y + 16}" text-anchor="middle" fill="white" '
-            f'font-weight="600">Leaf {slot + 1}</text>'
-            f'<text x="{lx}" y="{leaf_y + 30}" text-anchor="middle" fill="#a7f3d0" '
-            f'font-size="11">{result.inputs.leaf_ports}-port @ '
+            f'<rect x="{lx - leaf_hw}" y="{leaf_y}" width="{leaf_rect_w}" height="{leaf_hh}" '
+            f'rx="{box_rx}" fill="url(#leafGrad)" stroke="#065f46"/>'
+            f'<text x="{lx}" y="{lty1}" text-anchor="middle" fill="white" '
+            f'font-weight="600" font-size="{fs}">{lf_lbl}</text>'
+            f'<text x="{lx}" y="{lty2}" text-anchor="middle" fill="#a7f3d0" '
+            f'font-size="{fs_sm}">{result.inputs.leaf_ports}-p @ '
             f"{_fmt_speed(plane.leaf_speed)}</text>"
         )
 
     # ---------- Node row --------------------------------------------------
-    # Cap total node icons at MAX_NODE_ICONS (diagram-wide) and add
-    # ellipsis dots beneath each leaf when its real node count is larger.
-    MAX_NODE_ICONS = 24
-    gpus_per_node = result.inputs.gpus_per_node
-    drawn_leaf_count = sum(1 for s in leaf_slots if s is not ELLIPSIS) or 1
-    real_nodes_per_leaf = max(1, math.ceil(plane.gpus_per_leaf / gpus_per_node))
-    nodes_per_leaf_draw = max(
-        1,
-        min(
-            real_nodes_per_leaf,
-            MAX_NODE_ICONS // drawn_leaf_count,
-        ),
-    )
-    show_node_ellipsis = real_nodes_per_leaf > nodes_per_leaf_draw
-    leaf_nic_dash = ' stroke-dasharray="4 3"' if plane.leaf_breakout > 1 else ""
-
+    # Icon cap depends on zoom mode (see nodes_per_leaf_draw above).
+    rail_node_cx: Optional[float] = None
     for slot, lx in zip(leaf_slots, leaf_xs):
         if slot is ELLIPSIS:
-            parts.append(_ellipsis_dots(lx, node_y + 24, "#7c2d12"))
+            parts.append(_ellipsis_dots(lx, node_y + node_h / 2, "#7c2d12", ell_r))
             continue
         slots_in_group = nodes_per_leaf_draw + (1 if show_node_ellipsis else 0)
-        group_width = 82 * slots_in_group + 6 * (slots_in_group - 1)
+        group_width = node_w * slots_in_group + node_gap * (slots_in_group - 1)
         start_x = lx - group_width / 2
         for j in range(nodes_per_leaf_draw):
-            nx = start_x + j * (82 + 6)
+            nx = start_x + j * (node_w + node_gap)
+            ncx = nx + node_w / 2
+            if result.inputs.rail_design and slot == 0 and j == 0:
+                rail_node_cx = ncx
+            nty1 = node_y + node_h * 0.34
+            nty2 = node_y + node_h * 0.62
+            nty3 = node_y + node_h * 0.88
+            nic_fs = max(6, fs_sm - 2) if zoom_fit else 10
+            node_lbl = "Node 1" if slot == 0 and j == 0 else "Node"
+            draw_leaf_downlink = not (
+                result.inputs.rail_design
+                and not single_switch
+                and slot == 0
+                and j == 0
+            )
+            line_el = ""
+            if draw_leaf_downlink:
+                line_el = (
+                    f'<line x1="{lx}" y1="{leaf_y + leaf_hh}" x2="{ncx}" y2="{node_y}" '
+                    f'stroke="#f97316" stroke-width="{stroke_leaf_node}"{leaf_nic_dash}/>'
+                )
             parts.append(
-                f'<line x1="{lx}" y1="{leaf_y + 36}" x2="{nx + 41}" y2="{node_y}" '
-                f'stroke="#f97316" stroke-width="1.2"{leaf_nic_dash}/>'
-                f'<rect x="{nx}" y="{node_y}" width="82" height="50" rx="6" '
-                f'fill="url(#nodeGrad)" stroke="#7c2d12"/>'
-                f'<text x="{nx + 41}" y="{node_y + 16}" text-anchor="middle" fill="white" '
-                f'font-weight="600">Node</text>'
-                f'<text x="{nx + 41}" y="{node_y + 32}" text-anchor="middle" fill="#fed7aa" '
-                f'font-size="11">{gpus_per_node} GPUs</text>'
-                f'<text x="{nx + 41}" y="{node_y + 46}" text-anchor="middle" fill="#fed7aa" '
-                f'font-size="10">{result.inputs.nics_per_gpu}x{_fmt_speed(result.inputs.nic_speed)} NIC ({"single-plan" if result.inputs.plans_per_nic == 0 else f"{result.inputs.plans_per_nic}x{_fmt_speed(plane.nic_speed)}"})</text>'
+                line_el
+                + f'<rect x="{nx}" y="{node_y}" width="{node_w}" height="{node_h}" rx="{box_rx}" '
+                + f'fill="url(#nodeGrad)" stroke="#7c2d12"/>'
+                + f'<text x="{ncx}" y="{nty1}" text-anchor="middle" fill="white" '
+                + f'font-weight="600" font-size="{fs}">{node_lbl}</text>'
+                + f'<text x="{ncx}" y="{nty2}" text-anchor="middle" fill="#fed7aa" '
+                + f'font-size="{fs_sm}">{gpus_per_node} GPUs</text>'
+                + f'<text x="{ncx}" y="{nty3}" text-anchor="middle" fill="#fed7aa" '
+                + f'font-size="{nic_fs}">{result.inputs.nics_per_gpu}x{_fmt_speed(result.inputs.nic_speed)} NIC ({"single-plan" if result.inputs.plans_per_nic == 0 else f"{result.inputs.plans_per_nic}x{_fmt_speed(plane.nic_speed)}"})</text>'
             )
         if show_node_ellipsis:
-            ex = start_x + nodes_per_leaf_draw * (82 + 6) + 41
-            parts.append(_ellipsis_dots(ex, node_y + 24, "#7c2d12"))
+            ex = start_x + nodes_per_leaf_draw * (node_w + node_gap) + node_w / 2
+            parts.append(_ellipsis_dots(ex, node_y + node_h / 2, "#7c2d12", ell_r))
 
     # ---------- Layer labels & annotations --------------------------------
-    if has_super:
+    ly_super = super_y + ss_hh * 0.55 if has_super else 0
+    ly_spine = spine_y + spine_hh * 0.55 if not single_switch else 0
+    ly_leaf = leaf_y + leaf_hh * 0.55
+    ly_nodes = node_y + node_h * 0.48
+    if has_super and super_label_rx is not None:
         parts.append(
-            f'<text x="20" y="{super_y + 22}" fill="#4a1d96" font-weight="700">SUPER-SPINE</text>'
+            f'<text x="{super_label_rx}" y="{ly_super}" text-anchor="end" '
+            f'fill="#4a1d96" font-weight="700" font-size="{fs_mid}">SUPER-SPINE</text>'
         )
-    if not single_switch:
+    if not single_switch and spine_label_rx is not None:
         parts.append(
-            f'<text x="20" y="{spine_y + 22}" fill="#1e3a8a" font-weight="700">SPINE</text>'
+            f'<text x="{spine_label_rx}" y="{ly_spine}" text-anchor="end" '
+            f'fill="#1e3a8a" font-weight="700" font-size="{fs_mid}">SPINE</text>'
+        )
+    if leaf_label_rx is not None:
+        parts.append(
+            f'<text x="{leaf_label_rx}" y="{ly_leaf}" text-anchor="end" '
+            f'fill="#065f46" font-weight="700" font-size="{fs_mid}">LEAF</text>'
         )
     parts.append(
-        f'<text x="20" y="{leaf_y + 22}" fill="#065f46" font-weight="700">LEAF</text>'
-        f'<text x="20" y="{node_y + 24}" fill="#7c2d12" font-weight="700">NODES</text>'
+        f'<text x="{nodes_label_rx}" y="{ly_nodes}" text-anchor="end" '
+        f'fill="#7c2d12" font-weight="700" font-size="{fs_mid}">NODES</text>'
     )
 
     if has_super:
@@ -1127,7 +1315,7 @@ def render_svg(result: DesignResult) -> str:
             bk = f" (super-spine {plane.super_to_spine_fanout}:1 breakout)"
         parts.append(
             f'<text x="{width / 2}" y="{(super_y + spine_y) / 2}" text-anchor="middle" '
-            f'fill="#4a1d96">{_fmt_speed(e2e)} super-spine &#8596; spine{bk}</text>'
+            f'fill="#4a1d96" font-size="{fs_mid}">{_fmt_speed(e2e)} super-spine &#8596; spine{bk}</text>'
         )
 
     if not single_switch:
@@ -1140,7 +1328,7 @@ def render_svg(result: DesignResult) -> str:
             sl_note = ""
         parts.append(
             f'<text x="{width / 2}" y="{(spine_y + leaf_y) / 2}" text-anchor="middle" '
-            f'fill="#1e3a8a">{_fmt_speed(e2e_spine_leaf)} spine &#8596; leaf{sl_note}</text>'
+            f'fill="#1e3a8a" font-size="{fs_mid}">{_fmt_speed(e2e_spine_leaf)} spine &#8596; leaf{sl_note}</text>'
         )
 
     leaf_nic_note = (
@@ -1151,7 +1339,7 @@ def render_svg(result: DesignResult) -> str:
     )
     parts.append(
         f'<text x="{width / 2}" y="{(leaf_y + node_y) / 2 + 10}" text-anchor="middle" '
-        f'fill="#7c2d12">{_fmt_speed(plane.nic_speed)} to GPU NICs'
+        f'fill="#7c2d12" font-size="{fs_mid}">{_fmt_speed(plane.nic_speed)} to GPU NICs'
         f"{leaf_nic_note}{plan_note}</text>"
     )
 
@@ -1159,7 +1347,7 @@ def render_svg(result: DesignResult) -> str:
     if has_super and plane.pods_per_plane > 1:
         parts.append(
             f'<text x="{width / 2}" y="{leaf_y - 50}" text-anchor="middle" '
-            f'fill="#065f46" font-size="12" font-weight="600">'
+            f'fill="#065f46" font-size="{fs_mid}" font-weight="600">'
             f"Showing 1 of {plane.pods_per_plane} pods "
             f"({plane.leaves_per_pod} leaves + {plane.spines_per_pod} spines each)"
             f"</text>"
@@ -1174,7 +1362,7 @@ def render_svg(result: DesignResult) -> str:
     sp_part = f" &#183; {result.total_spines} spines" if result.total_spines else ""
     parts.append(
         f'<text x="{width / 2}" y="{height - 36}" text-anchor="middle" '
-        f'fill="#334155" font-size="13" font-weight="600">'
+        f'fill="#334155" font-size="{fs_bot}" font-weight="600">'
         f"{result.total_nodes} nodes &#183; {result.inputs.num_gpus} GPUs "
         f"&#183; {result.total_leaves} leaves"
         f"{sp_part}{ss_part} &#183; {result.num_planes} plan(s)</text>"
@@ -1186,19 +1374,67 @@ def render_svg(result: DesignResult) -> str:
         )
         parts.append(
             f'<text x="{width / 2}" y="{height - 14}" text-anchor="middle" '
-            f'fill="#475569" font-size="12">Cables: {cable_text}</text>'
+            f'fill="#475569" font-size="{fs_cable}">Cables: {cable_text}</text>'
         )
+
+    if (
+        result.inputs.rail_design
+        and rail_node_cx is not None
+        and not single_switch
+        and leaf_slots
+        and leaf_slots[0] == 0
+    ):
+        leaf_cx_by_index: dict[int, float] = {}
+        leaf_ellipsis_cx: Optional[float] = None
+        for slot, lx in zip(leaf_slots, leaf_xs):
+            if slot is ELLIPSIS:
+                leaf_ellipsis_cx = lx
+                continue
+            if isinstance(slot, int):
+                leaf_cx_by_index[slot] = lx
+
+        phantom_leaf_xs = _xs(draw_leaves_count, width)
+        rail_n = min(gpus_per_node, draw_leaves_count)
+        ay1 = node_y
+        ay2 = leaf_y + leaf_hh
+        missing_for_ellipsis: list[int] = [
+            ri for ri in range(rail_n) if ri not in leaf_cx_by_index
+        ]
+        ellipsis_offsets = _rail_ellipsis_fan_offsets(len(missing_for_ellipsis))
+        if rail_n >= 1:
+            parts.append('<g class="rail-links" pointer-events="none">')
+            sw_rail = max(0.75, stroke_leaf_node * 0.9)
+            for ri in range(rail_n):
+                if ri in leaf_cx_by_index:
+                    tx = leaf_cx_by_index[ri]
+                    split_x = leaf_ellipsis_cx
+                elif leaf_ellipsis_cx is not None:
+                    k = missing_for_ellipsis.index(ri)
+                    tx = leaf_ellipsis_cx + ellipsis_offsets[k]
+                    split_x = None
+                else:
+                    tx = phantom_leaf_xs[ri]
+                    split_x = leaf_ellipsis_cx
+                for x1, y1, x2, y2, op in _rail_line_segments(
+                    rail_node_cx, ay1, tx, ay2, split_x
+                ):
+                    parts.append(
+                        f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="#9a3412" '
+                        f'stroke-width="{sw_rail}" stroke-dasharray="3 5" opacity="{op}" />'
+                    )
+            parts.append("</g>")
 
     parts.append("</svg>")
     return "".join(parts)
 
 
-def _ellipsis_dots(cx: float, cy: float, color: str) -> str:
+def _ellipsis_dots(cx: float, cy: float, color: str, r: float = 3) -> str:
+    gap = max(r * 3.5, 8.0)
     return (
         f'<g fill="{color}">'
-        f'<circle cx="{cx - 12}" cy="{cy}" r="3"/>'
-        f'<circle cx="{cx}" cy="{cy}" r="3"/>'
-        f'<circle cx="{cx + 12}" cy="{cy}" r="3"/>'
+        f'<circle cx="{cx - gap}" cy="{cy}" r="{r}"/>'
+        f'<circle cx="{cx}" cy="{cy}" r="{r}"/>'
+        f'<circle cx="{cx + gap}" cy="{cy}" r="{r}"/>'
         "</g>"
     )
 
@@ -1256,7 +1492,8 @@ def _build_plan_comparison(form: dict[str, int]) -> list[dict[str, str | int]]:
 def index():
     form = dict(DEFAULTS)
     result = None
-    svg = None
+    svg_detail = None
+    svg_fit = None
     error = None
     compare_rows = None
     selected_action = "design"
@@ -1315,7 +1552,8 @@ def index():
 
             inp = DesignInputs(**form)
             result = design_fabric(inp)
-            svg = render_svg(result)
+            svg_detail = render_svg(result, "detail")
+            svg_fit = render_svg(result, "fit")
             if selected_action == "compare":
                 compare_rows = _build_plan_comparison(form)
         except Exception as exc:  # noqa: BLE001
@@ -1325,7 +1563,8 @@ def index():
         "index.html",
         form=form,
         result=result,
-        svg=svg,
+        svg_detail=svg_detail,
+        svg_fit=svg_fit,
         error=error,
         compare_rows=compare_rows,
         selected_action=selected_action,
