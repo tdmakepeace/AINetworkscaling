@@ -197,10 +197,79 @@
       background: #fafafa;
       border-radius: 14px;
       padding: 12px;
-      overflow-x: auto;
       border: 1px solid var(--border);
     }
-    .diagram svg { display: block; width: 100%; height: auto; }
+    .diagram-layout {
+      display: flex;
+      flex-direction: row;
+      align-items: flex-start;
+      gap: 6px;
+      width: 100%;
+      box-sizing: border-box;
+    }
+    .diagram-zoom-rail {
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-start;
+      align-items: stretch;
+      gap: 4px;
+      flex: 0 0 auto;
+      padding: 0 4px 0 0;
+      margin: 0;
+      align-self: stretch;
+    }
+    .diagram-zoom-main {
+      flex: 1 1 auto;
+      min-width: 0;
+      overflow-x: auto;
+    }
+    .diagram-zoom-main svg {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+    .diagram-zoom-fit-wrap {
+      max-height: min(88vh, 1200px);
+      overflow: auto;
+    }
+    .diagram-zoom-btn {
+      box-sizing: border-box;
+      appearance: none;
+      -webkit-appearance: none;
+      font: inherit;
+      font-size: 8px;
+      font-weight: 600;
+      line-height: 1.05;
+      letter-spacing: 0.02em;
+      text-align: center;
+      padding: 2px 3px;
+      margin: 0;
+      border-radius: 4px;
+      border: 1px solid #a1a1aa;
+      background: linear-gradient(180deg, #e4e4e7 0%, #d4d4d8 100%);
+      color: #3f3f46;
+      cursor: pointer;
+      white-space: normal;
+      word-break: break-word;
+      max-width: 82px;
+      max-height: 50px;
+      min-width: 44px;
+      min-height: 22px;
+      width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .diagram-zoom-btn:hover {
+      border-color: #71717a;
+      background: linear-gradient(180deg, #e7e7ea 0%, #d8d8dc 100%);
+      color: #18181b;
+    }
+    .diagram-zoom-btn.active {
+      border-color: #71717a;
+      background: linear-gradient(180deg, #d4d4d8 0%, #c4c4c8 100%);
+      color: #18181b;
+      box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.08);
+    }
     .notes ul { margin: 6px 0 0 18px; padding: 0; }
     .notes li { margin: 4px 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
     .error {
@@ -317,8 +386,121 @@
       font-size: 13px;
     }
     .bom-shuffle strong { color: var(--amd-red-hover); }
+    .bom-shuffle-help {
+      margin: 10px 0 0;
+      padding: 0;
+    }
+    .bom-shuffle-link {
+      font: inherit;
+      font-size: 12px;
+      padding: 0;
+      margin: 0;
+      border: none;
+      background: none;
+      color: var(--amd-red-hover);
+      cursor: pointer;
+      text-decoration: underline;
+      text-underline-offset: 2px;
+    }
+    .bom-shuffle-link:hover {
+      color: #fff;
+    }
 
-    /* Compare plans modal */
+    .shuffle-modal {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 1150;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .shuffle-modal.is-open {
+      display: flex;
+    }
+    .shuffle-modal-backdrop {
+      position: absolute;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.75);
+      cursor: pointer;
+    }
+    .shuffle-modal-dialog {
+      position: relative;
+      width: min(980px, 100%);
+      max-height: min(90vh, 960px);
+      display: flex;
+      flex-direction: column;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      box-shadow: 0 24px 80px rgba(0, 0, 0, 0.55);
+    }
+    .shuffle-modal-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 16px 18px 12px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .shuffle-modal-header h2 {
+      margin: 0;
+      font-size: 17px;
+      font-weight: 650;
+    }
+    .shuffle-modal-close {
+      flex-shrink: 0;
+      width: 38px;
+      height: 38px;
+      margin: 0;
+      padding: 0;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--text);
+      font-size: 22px;
+      line-height: 1;
+      cursor: pointer;
+    }
+    .shuffle-modal-close:hover {
+      filter: brightness(1.08);
+      border-color: var(--amd-red);
+    }
+    .shuffle-modal-body {
+      padding: 16px 18px 20px;
+      overflow: auto;
+      flex: 1;
+      min-height: 0;
+    }
+    .shuffle-figure {
+      margin: 0 0 28px;
+      padding: 0;
+    }
+    .shuffle-figure:last-child {
+      margin-bottom: 0;
+    }
+    .shuffle-figure figcaption {
+      margin: 0 0 8px;
+      font-size: 14px;
+      color: var(--text);
+    }
+    .shuffle-caption {
+      margin: 0 0 12px;
+      font-size: 13px;
+      line-height: 1.55;
+      color: var(--muted);
+      max-width: 85ch;
+    }
+    .shuffle-modal-img {
+      display: block;
+      width: 100%;
+      max-width: 100%;
+      height: auto;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: #fff;
+    }
     .compare-modal {
       display: none;
       position: fixed;
@@ -759,9 +941,24 @@
           {% endif %}
         </div>
 
+        {% if svg_detail %}
         <div class="panel diagram">
-          {{ svg | safe }}
+          <div class="diagram-layout">
+            <div class="diagram-zoom-rail" role="toolbar" aria-label="Topology zoom">
+              <button type="button" class="diagram-zoom-btn active" id="diagram_zoom_detail" aria-pressed="true" title="Zoom in (detail view)">
+                Detail
+              </button>
+              <button type="button" class="diagram-zoom-btn" id="diagram_zoom_fit" aria-pressed="false" title="Zoom out (fit entire fabric)">
+                Fit all
+              </button>
+            </div>
+            <div class="diagram-zoom-main">
+              <div id="topology_diagram_detail">{{ svg_detail | safe }}</div>
+              <div id="topology_diagram_fit" class="diagram-zoom-fit-wrap" hidden>{{ svg_fit | safe }}</div>
+            </div>
+          </div>
         </div>
+        {% endif %}
 
         {% if result.bom %}
         <div class="panel notes">
@@ -827,6 +1024,11 @@
           <div class="bom-shuffle">
             <strong>Shuffle boxes (node-side plan split):</strong>
             <span style="color: var(--muted);"> {{ bom.shuffle_box_note }}</span>
+            <p class="bom-shuffle-help">
+              <button type="button" class="bom-shuffle-link" id="shuffle-diagrams-open" aria-haspopup="dialog" aria-controls="shuffle-modal">
+                Shuffle box diagrams (4×4 and 8×8)
+              </button>
+            </p>
           </div>
         </div>
         {% endif %}
@@ -991,6 +1193,52 @@
       </div>
     </div>
   </div>
+  <div
+    id="shuffle-modal"
+    class="shuffle-modal"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="shuffle-modal-title"
+    aria-hidden="true"
+  >
+    <div class="shuffle-modal-backdrop" data-shuffle-close></div>
+    <div class="shuffle-modal-dialog">
+      <div class="shuffle-modal-header">
+        <h2 id="shuffle-modal-title">Shuffle box diagrams</h2>
+        <button type="button" class="shuffle-modal-close" data-shuffle-close aria-label="Close shuffle diagrams">&times;</button>
+      </div>
+      <div class="shuffle-modal-body">
+        <figure class="shuffle-figure">
+          <figcaption><strong>Image 1 — 4×4 shuffle</strong></figcaption>
+          <p class="shuffle-caption">
+            In this method, pairs of fibers from a single MPO-8/12 connector (left, unshuffled) are distributed across
+            four different MPO-8/12 connectors (right, shuffled), allowing connections to more switch ports with the
+            same number of MPO connectors.
+          </p>
+          <img
+            class="shuffle-modal-img"
+            src="{{ url_for('static', filename='img/shuffle-4x4.png') }}"
+            alt="Diagram: four input MPO connectors unshuffled on the left, four output connectors shuffled on the right with fiber crossover wiring"
+            loading="lazy"
+          />
+        </figure>
+        <figure class="shuffle-figure">
+          <figcaption><strong>Image 2 — 8×8 shuffle</strong></figcaption>
+          <p class="shuffle-caption">
+            In this method, pairs of fibers from a single MPO-16 connector (top, unshuffled) are distributed across
+            eight different MPO-16 connectors (bottom, shuffled), allowing connections to more switch ports with the
+            same number of MPO connectors.
+          </p>
+          <img
+            class="shuffle-modal-img"
+            src="{{ url_for('static', filename='img/shuffle-8x8.png') }}"
+            alt="Diagram: eight MPO-16 inputs unshuffled on top, eight shuffled outputs below with full mesh fiber routing"
+            loading="lazy"
+          />
+        </figure>
+      </div>
+    </div>
+  </div>
   <script>
     (function () {
       var railCheckbox = document.getElementById("rail_design");
@@ -1113,6 +1361,65 @@
       document.addEventListener("keydown", function (e) {
         if (e.key === "Escape" && modal.classList.contains("is-open")) closeModal();
       });
+    })();
+  </script>
+  <script>
+    (function () {
+      var openBtn = document.getElementById("shuffle-diagrams-open");
+      var shuffleModal = document.getElementById("shuffle-modal");
+      if (!openBtn || !shuffleModal) return;
+
+      function openShuffle() {
+        shuffleModal.classList.add("is-open");
+        shuffleModal.setAttribute("aria-hidden", "false");
+        document.body.style.overflow = "hidden";
+      }
+
+      function closeShuffle() {
+        shuffleModal.classList.remove("is-open");
+        shuffleModal.setAttribute("aria-hidden", "true");
+        document.body.style.overflow = "";
+      }
+
+      openBtn.addEventListener("click", function () {
+        openShuffle();
+      });
+      shuffleModal.querySelectorAll("[data-shuffle-close]").forEach(function (el) {
+        el.addEventListener("click", closeShuffle);
+      });
+      document.addEventListener("keydown", function (e) {
+        if (e.key === "Escape" && shuffleModal.classList.contains("is-open")) closeShuffle();
+      });
+    })();
+  </script>
+  <script>
+    (function () {
+      var btnDetail = document.getElementById("diagram_zoom_detail");
+      var btnFit = document.getElementById("diagram_zoom_fit");
+      var wrapDetail = document.getElementById("topology_diagram_detail");
+      var wrapFit = document.getElementById("topology_diagram_fit");
+      if (!btnDetail || !btnFit || !wrapDetail || !wrapFit) return;
+
+      function showDetail() {
+        wrapDetail.hidden = false;
+        wrapFit.hidden = true;
+        btnDetail.classList.add("active");
+        btnFit.classList.remove("active");
+        btnDetail.setAttribute("aria-pressed", "true");
+        btnFit.setAttribute("aria-pressed", "false");
+      }
+
+      function showFit() {
+        wrapDetail.hidden = true;
+        wrapFit.hidden = false;
+        btnFit.classList.add("active");
+        btnDetail.classList.remove("active");
+        btnFit.setAttribute("aria-pressed", "true");
+        btnDetail.setAttribute("aria-pressed", "false");
+      }
+
+      btnDetail.addEventListener("click", showDetail);
+      btnFit.addEventListener("click", showFit);
     })();
   </script>
 </body>
