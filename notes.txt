@@ -11,6 +11,11 @@ python -m pip install auto-py-to-exe --upgrade
 
 auto-py-to-exe
 
+
+pyinstaller --noconfirm --onefile --windowed --add-data "C:\Users\tmakepea\OneDrive - Advanced Micro Devices Inc\Documents\Cursor Projects\AInetworkingscaling\templates;templates/" --add-data "C:\Users\tmakepea\OneDrive - Advanced Micro Devices Inc\Documents\Cursor Projects\AInetworkingscaling\static;static/" --add-data "C:\Users\tmakepea\OneDrive - Advanced Micro Devices Inc\Documents\Cursor Projects\AInetworkingscaling\static\img;img/"  "C:\Users\tmakepea\OneDrive - Advanced Micro Devices Inc\Documents\Cursor Projects\AInetworkingscaling\app.py"
+
+
+
 # import the json, or set the following settings.
 # add he folder for templates to be included in  one file, windows based.
 

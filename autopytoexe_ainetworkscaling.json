@@ -52,6 +52,14 @@
   {
    "optionDest": "datas",
    "value": "C:/Users/tmakepea/OneDrive - Advanced Micro Devices Inc/Documents/Cursor Projects/AInetworkingscaling/templates;templates/"
+  },
+  {
+   "optionDest": "datas",
+   "value": "C:/Users/tmakepea/OneDrive - Advanced Micro Devices Inc/Documents/Cursor Projects/AInetworkingscaling/static;static/"
+  },
+  {
+   "optionDest": "datas",
+   "value": "C:/Users/tmakepea/OneDrive - Advanced Micro Devices Inc/Documents/Cursor Projects/AInetworkingscaling/static/img;img/"
   }
  ],
  "nonPyinstallerOptions": {
