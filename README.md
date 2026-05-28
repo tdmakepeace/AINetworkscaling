@@ -58,43 +58,35 @@ pip install -r requirements.txt
 
 For **tests** (optional), install **pytest** in the same environment (for example `pip install pytest`) and run `pytest` from the repository root (see `pytest.ini`).
 
-### Run with Docker or Podman
+### Docker
 
-The container runs **Flask only** on port **10000** (no desktop **pywebview** window inside the image).
+#### Docker build and start
 
-1. Build the image:
+From the project root (`/apps/NGINX` on the host):
 
-```bash
-docker build -t ainetwork-designer .
-```
-
-With **Podman**:
+Build/rebuild image:
 
 ```bash
-podman build -t ainetwork-designer .
+docker compose build --no-cache
 ```
 
-2. Run the container and publish the app port:
+Start container:
 
 ```bash
-docker run --rm -p 10000:10000 --name ainetwork-designer ainetwork-designer
+docker compose up -d
 ```
+
+Restart after config/page changes:
 
 ```bash
-podman run --rm -p 10000:10000 --name ainetwork-designer ainetwork-designer
+docker compose restart
 ```
 
-3. Open the app in your browser:
+Stop container:
 
-`http://localhost:10000/`
-
-4. Stop the app:
-
-- Press `Ctrl+C` in the terminal running the container (foreground), or stop the name you chose, for example `docker stop ainetwork-designer` or `podman stop ainetwork-designer`, if you ran detached.
-
-Optional:
-
-- Run detached: `docker run -d -p 10000:10000 --name ainetwork-designer ainetwork-designer` (same pattern with `podman run -d …`).
+```bash
+docker compose down
+```
 
 ### Windows
 
