@@ -1,0 +1,9 @@
+services:
+  ainetwork-designer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ainetwork-designer
+    ports:
+      - "10000:10000"
+    restart: unless-stopped
