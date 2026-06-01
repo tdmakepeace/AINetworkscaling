@@ -172,6 +172,14 @@ def _cable_count(total_links: int, fanout_a_to_b: int, fanout_b_to_a: int) -> in
     return math.ceil(total_links / per_cable)
 
 
+# Minimum spines / super-spines whenever that tier is introduced (path redundancy).
+MIN_TIER_SWITCHES = 2
+
+
+def _clampTierSwitchCount(count: int) -> int:
+    return max(count, MIN_TIER_SWITCHES)
+
+
 def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
     notes: list[str] = []
 
@@ -235,7 +243,9 @@ def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
     # downlink (with breakout), a spine layer is unnecessary - a single leaf
     # terminates the whole plane.
     max_gpus_one_switch = inp.leaf_ports * leaf_breakout
-    if gpus_per_plane <= max_gpus_one_switch:
+    # Rail needs at least one leaf per GPU in a node (gpus_per_node leaf switches).
+    rail_needs_leaf_row = inp.rail_design and inp.gpus_per_node > 1
+    if gpus_per_plane <= max_gpus_one_switch and not rail_needs_leaf_row:
         return _single_switch_result(
             inp, num_planes, gpus_per_plane, leaf_breakout, notes
         )
@@ -250,10 +260,13 @@ def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
     leaves_per_plane = math.ceil(gpus_per_plane / gpus_per_leaf)
     if inp.rail_design:
         rail_multiple = inp.gpus_per_node
+        leaves_per_plane = max(leaves_per_plane, rail_multiple)
         leaves_per_plane = math.ceil(leaves_per_plane / rail_multiple) * rail_multiple
         notes.append(
-            f"Rail design enabled: leaves per plan are rounded up to a multiple of GPUs per node "
-            f"({inp.gpus_per_node}); using {leaves_per_plane} leaves/plan."
+            f"Rail design enabled: node-to-leaf mapping uses {inp.gpus_per_node} leaf "
+            f"switches per node (GPUi to leaf i); minimum {rail_multiple} leaves/plan, "
+            f"rounded up to a multiple of GPUs per node — using {leaves_per_plane} "
+            f"leaves/plan."
         )
 
     # --- 2-tier sizing (first-pass) -------------------------------------
@@ -264,19 +277,31 @@ def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
     links_per_leaf_to_each_spine = 1
     spine_ports_used = math.ceil(leaves_per_plane / spine_to_leaf_fanout)
 
-    # Try link bundling to reduce spine count while respecting spine radix
+    # Try link bundling to reduce spine count while respecting spine radix.
+    # Never bundle below MIN_TIER_SWITCHES spines (redundant spine pair).
     for b in range(links_per_leaf, 1, -1):
         if links_per_leaf % b:
+            continue
+        spines_candidate = links_per_leaf // b
+        if spines_candidate < MIN_TIER_SWITCHES:
             continue
         candidate = math.ceil((leaves_per_plane * b) / spine_to_leaf_fanout)
         if candidate <= inp.spine_ports:
             if b > 1:
                 links_per_leaf_to_each_spine = b
-                spines_per_plane = links_per_leaf // b
+                spines_per_plane = spines_candidate
                 spine_ports_used = candidate
             break
 
-    two_tier_ok = spine_ports_used <= inp.spine_ports
+    spine_redundancy_ok = links_per_leaf >= MIN_TIER_SWITCHES
+    if spines_per_plane < MIN_TIER_SWITCHES and spine_redundancy_ok:
+        links_per_leaf_to_each_spine = links_per_leaf // MIN_TIER_SWITCHES
+        spines_per_plane = MIN_TIER_SWITCHES
+        spine_ports_used = math.ceil(
+            (leaves_per_plane * links_per_leaf_to_each_spine) / spine_to_leaf_fanout
+        )
+
+    two_tier_ok = spine_ports_used <= inp.spine_ports and spine_redundancy_ok
     plane_kwargs = dict(
         nic_speed_raw=inp.nic_speed,
         nic_speed=nic_plan_speed,
@@ -302,8 +327,11 @@ def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
     if two_tier_ok:
         notes.append(
             f"2-tier spine-leaf is sufficient "
-            f"(leaves={leaves_per_plane}, each spine uses {spine_ports_used}/"
-            f"{inp.spine_ports} ports)."
+            f"(leaves={leaves_per_plane}, {spines_per_plane} spines/plan, "
+            f"each spine uses {spine_ports_used}/{inp.spine_ports} ports)."
+        )
+        notes.append(
+            f"Spine redundancy: at least {MIN_TIER_SWITCHES} spines per plan."
         )
         if inp.super_spine_speed:
             notes.append(
@@ -338,12 +366,20 @@ def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
 
     # 2-tier not sufficient.
     if inp.super_spine_speed == 0:
-        notes.append(
-            f"2-tier infeasible: a single spine would need {spine_ports_used} "
-            f"ports to accept one link from each of {leaves_per_plane} leaves "
-            f"(after {spine_to_leaf_fanout}:1 breakout), but spines only have "
-            f"{inp.spine_ports} ports. Enable a super-spine tier to continue."
-        )
+        if not spine_redundancy_ok:
+            notes.append(
+                f"2-tier infeasible: leaf uplinks support only {links_per_leaf} "
+                f"spine path(s), but at least {MIN_TIER_SWITCHES} spines per plan "
+                f"are required for redundancy. Increase leaf uplink capacity or "
+                f"enable a super-spine tier."
+            )
+        else:
+            notes.append(
+                f"2-tier infeasible: a single spine would need {spine_ports_used} "
+                f"ports to accept one link from each of {leaves_per_plane} leaves "
+                f"(after {spine_to_leaf_fanout}:1 breakout), but spines only have "
+                f"{inp.spine_ports} ports. Enable a super-spine tier to continue."
+            )
         _add_common_notes(
             notes,
             inp,
@@ -376,7 +412,9 @@ def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
     leaves_per_pod = spine_ports_down * spine_to_leaf_fanout
 
     # Each pod uses a full spine-leaf mesh without bundling.
-    spines_per_pod = links_per_leaf  # = uplink_ports * leaf_to_spine_fanout
+    spines_per_pod = _clampTierSwitchCount(
+        links_per_leaf
+    )  # = uplink_ports * leaf_to_spine_fanout
     pods_per_plane = math.ceil(leaves_per_plane / leaves_per_pod)
     spines_per_plane_3t = spines_per_pod * pods_per_plane
 
@@ -392,8 +430,8 @@ def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
         spines_per_plane_3t * spine_ports_up * spine_to_super_fanout
     )
     links_absorbed_per_super = inp.super_spine_ports * super_to_spine_fanout
-    super_spines_per_plane = max(
-        1, math.ceil(total_spine_super_links / links_absorbed_per_super)
+    super_spines_per_plane = _clampTierSwitchCount(
+        math.ceil(total_spine_super_links / links_absorbed_per_super)
     )
     ports_used_per_super = (
         inp.super_spine_ports
@@ -404,7 +442,11 @@ def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
     # bundling. We flag infeasibility only if a spine can't even fan out
     # at one link per super-spine that holds it.
     spine_reach = spine_ports_up * spine_to_super_fanout
-    feasible = spine_reach >= 1 and super_spines_per_plane >= 1
+    feasible = (
+        spine_reach >= 1
+        and super_spines_per_plane >= MIN_TIER_SWITCHES
+        and spines_per_pod >= MIN_TIER_SWITCHES
+    )
 
     plane_kwargs.update(
         spines_per_plane=spines_per_plane_3t,
@@ -429,6 +471,10 @@ def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
         f"{leaves_per_pod} leaves and {spines_per_pod} spines; "
         f"{super_spines_per_plane} super-spines @ {inp.super_spine_speed}G "
         f"with {inp.super_spine_ports} ports each."
+    )
+    notes.append(
+        f"Spine and super-spine redundancy: at least {MIN_TIER_SWITCHES} "
+        f"spines per pod and {MIN_TIER_SWITCHES} super-spines per plan."
     )
     notes.append(
         f"Each spine splits its {inp.spine_ports} ports as "

@@ -799,7 +799,7 @@
           {% if form.rail_design %}checked{% endif %}
         />
         <div class="toggle-meta">
-          <label for="rail_design">Rail design (force leaf count to a multiple of GPUs per node)</label>
+          <label for="rail_design">Rail design (node-to-leaf: {{ form.gpus_per_node }} GPU-to-leaf paths per node)</label>
           <a
             id="rail-preview-link"
             class="inline-link"
