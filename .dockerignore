@@ -13,3 +13,8 @@ terminals
 _smoketest.py
 _check.ps1
 _preview.svg
+.ruff_cache
+output
+autopytoexe*
+tests
+pytest.ini
