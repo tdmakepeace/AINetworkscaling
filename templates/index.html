@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" href="{{ url_for('static', filename='favicon.ico') }}" type="image/x-icon" />
   <title>AMD — AI Spine-Leaf Network Designer</title>
   <style>
     /* Palette inspired by amd.com (AMD red on dark neutrals) */
@@ -581,6 +582,25 @@
     .compare-modal-body .compare-table {
       margin: 0;
     }
+    .compare-ratio-form {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+      margin: 10px 0 14px;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel-2);
+    }
+    .compare-ratio-form label {
+      font-size: 13px;
+      color: var(--muted);
+      margin: 0;
+    }
+    .compare-ratio-form select {
+      min-width: 120px;
+    }
     .toggle-field {
       display: flex;
       align-items: center;
@@ -812,12 +832,12 @@
 
       <div class="row">
         <div class="field">
-          <label for="spine_ports">Ports per spine switch</label>
-          <input id="spine_ports" name="spine_ports" type="number" min="2" value="{{ form.spine_ports }}" required />
-        </div>
-        <div class="field">
           <label for="leaf_ports">Ports per leaf switch</label>
           <input id="leaf_ports" name="leaf_ports" type="number" min="2" value="{{ form.leaf_ports }}" required />
+        </div>
+        <div class="field">
+          <label for="spine_ports">Ports per spine switch</label>
+          <input id="spine_ports" name="spine_ports" type="number" min="2" value="{{ form.spine_ports }}" required />
         </div>
       </div>
 
@@ -826,6 +846,14 @@
         <select id="nic_speed" name="nic_speed">
           <option value="400" {% if form.nic_speed == 400 %}selected{% endif %}>400G</option>
           <option value="800" {% if form.nic_speed == 800 %}selected{% endif %}>800G</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="match_interface_speed_to_nic">Match fabric interface speed to NIC speed</label>
+        <select id="match_interface_speed_to_nic" name="match_interface_speed_to_nic">
+          <option value="no" {% if not form.match_interface_speed_to_nic %}selected{% endif %}>No</option>
+          <option value="yes" {% if form.match_interface_speed_to_nic %}selected{% endif %}>Yes</option>
         </select>
       </div>
 
@@ -844,6 +872,27 @@
             <option value="400" {% if form.spine_speed == 400 %}selected{% endif %}>400G</option>
             <option value="800" {% if form.spine_speed == 800 %}selected{% endif %}>800G</option>
             <option value="1600" {% if form.spine_speed == 1600 %}selected{% endif %}>1.6T</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="field">
+          <label for="leaf_spine_ratio">Leaf-to-spine ratio</label>
+          <select id="leaf_spine_ratio" name="leaf_spine_ratio">
+            <option value="1:1" {% if form.leaf_spine_ratio == '1:1' %}selected{% endif %}>1:1</option>
+            <option value="1:1.1" {% if form.leaf_spine_ratio == '1:1.1' %}selected{% endif %}>1:1.1</option>
+            <option value="1:1.16" {% if form.leaf_spine_ratio == '1:1.16' %}selected{% endif %}>1:1.16</option>
+            <option value="1:1.20" {% if form.leaf_spine_ratio == '1:1.20' %}selected{% endif %}>1:1.20</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="spine_super_ratio">Spine-to-super-spine ratio</label>
+          <select id="spine_super_ratio" name="spine_super_ratio">
+            <option value="1:1" {% if form.spine_super_ratio == '1:1' %}selected{% endif %}>1:1</option>
+            <option value="1:1.1" {% if form.spine_super_ratio == '1:1.1' %}selected{% endif %}>1:1.1</option>
+            <option value="1:1.16" {% if form.spine_super_ratio == '1:1.16' %}selected{% endif %}>1:1.16</option>
+            <option value="1:1.20" {% if form.spine_super_ratio == '1:1.20' %}selected{% endif %}>1:1.20</option>
           </select>
         </div>
       </div>
@@ -951,6 +1000,15 @@
               <button type="button" class="diagram-zoom-btn" id="diagram_zoom_fit" aria-pressed="false" title="Zoom out (fit entire fabric)">
                 Fit all
               </button>
+              <button
+                type="button"
+                class="diagram-zoom-btn"
+                id="diagram_copy_image"
+                aria-pressed="false"
+                title="Copy diagram as an image to clipboard"
+              >
+                Copy image
+              </button>
             </div>
             <div class="diagram-zoom-main">
               <div id="topology_diagram_detail">{{ svg_detail | safe }}</div>
@@ -963,63 +1021,66 @@
         {% if result.bom %}
         <div class="panel notes">
           <h2>Bill of materials</h2>
-          <p style="color: var(--muted); font-size: 13px; margin: 0 0 6px;">
-            Per-layer switch counts (radix &amp; port speed) and cable quantities with optic/cable type labels
-            (breakout forms such as <code>800G-2x400G</code> are as modeled in the design).
+          <p style="color: var(--muted); font-size: 13px; margin: 0 0 12px;">
+            {{ result.bom.context_line }}
+            Optics are physical cable/optic assemblies; cables are logical link counts
+            (breakout lanes such as <code>800G - 2x400G</code> carry multiple links).
           </p>
 
           {% set bom = result.bom %}
 
+          {% macro bom_layer(layer) %}
           <div class="bom-layer">
-            <h3>{{ bom.super_spine.title }}</h3>
-            {% if bom.super_spine.layer_note %}
-              <p style="color: var(--muted); font-size: 12px; margin: 0 0 8px;">{{ bom.super_spine.layer_note }}</p>
-            {% endif %}
             <table class="bom-table">
-              <tr><th>Switches</th><td>{{ "{:,}".format(bom.super_spine.switch_quantity) }} &times; {{ bom.super_spine.switch_specification }}</td></tr>
-              {% if bom.super_spine.cable_lines %}
-                {% for line in bom.super_spine.cable_lines %}
-                <tr><th>Cables to spine</th><td>{{ "{:,}".format(line.quantity) }} &times; {{ line.specification }}</td></tr>
-                {% endfor %}
-              {% else %}
-                <tr><th>Cables to spine</th><td>—</td></tr>
+              <tr><th>Switch type</th><td>{{ layer.title }}</td></tr>
+              <tr>
+                <th>Number of Switches</th>
+                <td>
+                  {% if layer.switch_quantity > 0 %}
+                    {{ "{:,}".format(layer.switch_quantity) }} &times; {{ layer.switch_specification }}
+                  {% else %}
+                    0
+                  {% endif %}
+                </td>
+              </tr>
+              {% if layer.south_to %}
+              <tr>
+                <th>Optics South to {{ layer.south_to }}</th>
+                <td>
+                  {% if layer.south.optics_count > 0 %}
+                    {{ "{:,}".format(layer.south.optics_count) }} &times; {{ layer.south.optics_label }}
+                  {% else %}
+                    0
+                  {% endif %}
+                </td>
+              </tr>
+              <tr>
+                <th>Cables South to {{ layer.south_to }}</th>
+                <td>{{ "{:,}".format(layer.south.cables_count) }}</td>
+              </tr>
+              {% endif %}
+              {% if layer.north_to %}
+              <tr>
+                <th>Optics North to {{ layer.north_to }}</th>
+                <td>
+                  {% if layer.north.optics_count > 0 %}
+                    {{ "{:,}".format(layer.north.optics_count) }} &times; {{ layer.north.optics_label }}
+                  {% else %}
+                    0
+                  {% endif %}
+                </td>
+              </tr>
               {% endif %}
             </table>
+            {% if layer.layer_note %}
+              <p style="color: var(--muted); font-size: 12px; margin: 8px 0 0;">{{ layer.layer_note }}</p>
+            {% endif %}
           </div>
+          {% endmacro %}
 
-          <div class="bom-layer">
-            <h3>{{ bom.spine.title }}</h3>
-            {% if bom.spine.layer_note %}
-              <p style="color: var(--muted); font-size: 12px; margin: 0 0 8px;">{{ bom.spine.layer_note }}</p>
-            {% endif %}
-            <table class="bom-table">
-              <tr><th>Switches</th><td>{{ "{:,}".format(bom.spine.switch_quantity) }} &times; {{ bom.spine.switch_specification }}</td></tr>
-              {% if bom.spine.cable_lines %}
-                {% for line in bom.spine.cable_lines %}
-                <tr><th>Cables to leaf</th><td>{{ "{:,}".format(line.quantity) }} &times; {{ line.specification }}</td></tr>
-                {% endfor %}
-              {% else %}
-                <tr><th>Cables to leaf</th><td>—</td></tr>
-              {% endif %}
-            </table>
-          </div>
-
-          <div class="bom-layer">
-            <h3>{{ bom.leaf.title }}</h3>
-            {% if bom.leaf.layer_note %}
-              <p style="color: var(--muted); font-size: 12px; margin: 0 0 8px;">{{ bom.leaf.layer_note }}</p>
-            {% endif %}
-            <table class="bom-table">
-              <tr><th>Switches</th><td>{{ "{:,}".format(bom.leaf.switch_quantity) }} &times; {{ bom.leaf.switch_specification }}</td></tr>
-              {% if bom.leaf.cable_lines %}
-                {% for line in bom.leaf.cable_lines %}
-                <tr><th>Cables to node</th><td>{{ "{:,}".format(line.quantity) }} &times; {{ line.specification }}</td></tr>
-                {% endfor %}
-              {% else %}
-                <tr><th>Cables to node</th><td>—</td></tr>
-              {% endif %}
-            </table>
-          </div>
+          {{ bom_layer(bom.super_spine) }}
+          {{ bom_layer(bom.spine) }}
+          {{ bom_layer(bom.leaf) }}
 
           <div class="bom-shuffle">
             <strong>Shuffle boxes (node-side plan split):</strong>
@@ -1079,8 +1140,36 @@
         <div>
           <h2 id="compare-modal-title">Plans-per-NIC comparison</h2>
           <p>
-            {{ form.num_gpus }} GPUs, {{ form.nics_per_gpu }} NIC/GPU — pick <b>plans per NIC</b>, then run <b>Design fabric</b>.
+            {{ form.num_gpus }} GPUs<br>
+            {{ form.nics_per_gpu }} NIC/GPU<br>
+            Option 1 - Match fabric to NIC - No<br>
+            Option 2 - Match fabric to NIC - Yes<br>
+            Plans per NIC (0, 1, 2, 4)
           </p>
+          <form method="post" class="compare-ratio-form">
+            <input type="hidden" name="num_gpus" value="{{ form.num_gpus }}" />
+            <input type="hidden" name="gpus_per_node" value="{{ form.gpus_per_node }}" />
+            <input type="hidden" name="nics_per_gpu" value="{{ form.nics_per_gpu }}" />
+            <input type="hidden" name="spine_ports" value="{{ form.spine_ports }}" />
+            <input type="hidden" name="super_spine_ports" value="{{ form.super_spine_ports }}" />
+            <input type="hidden" name="leaf_ports" value="{{ form.leaf_ports }}" />
+            <input type="hidden" name="nic_speed" value="{{ form.nic_speed }}" />
+            <input type="hidden" name="leaf_speed" value="{{ form.leaf_speed }}" />
+            <input type="hidden" name="spine_speed" value="{{ form.spine_speed }}" />
+            <input type="hidden" name="super_spine_speed" value="{{ form.super_spine_speed }}" />
+            <input type="hidden" name="plans_per_nic" value="{{ form.plans_per_nic }}" />
+            <input type="hidden" name="spine_super_ratio" value="{{ form.spine_super_ratio }}" />
+            <input type="hidden" name="match_interface_speed_to_nic" value="{% if form.match_interface_speed_to_nic %}yes{% else %}no{% endif %}" />
+            {% if form.rail_design %}<input type="hidden" name="rail_design" value="on" />{% endif %}
+            <label for="compare_leaf_spine_ratio">Leaf-to-spine ratio</label>
+            <select id="compare_leaf_spine_ratio" name="leaf_spine_ratio">
+              <option value="1:1" {% if form.leaf_spine_ratio == '1:1' %}selected{% endif %}>1:1</option>
+              <option value="1:1.1" {% if form.leaf_spine_ratio == '1:1.1' %}selected{% endif %}>1:1.1</option>
+              <option value="1:1.16" {% if form.leaf_spine_ratio == '1:1.16' %}selected{% endif %}>1:1.16</option>
+              <option value="1:1.20" {% if form.leaf_spine_ratio == '1:1.20' %}selected{% endif %}>1:1.20</option>
+            </select>
+            <button class="button-secondary" type="submit" name="action" value="compare">Update</button>
+          </form>
         </div>
         <button type="button" class="compare-modal-close" data-compare-close aria-label="Close comparison">&times;</button>
       </div>
@@ -1088,6 +1177,8 @@
         <table class="compare-table">
           <thead>
             <tr>
+              <th>Option</th>
+              <th>Match fabric to NIC</th>
               <th>Plans/NIC</th>
               <th>Feasible</th>
               <th>Topology</th>
@@ -1101,6 +1192,8 @@
           <tbody>
             {% for row in compare_rows %}
             <tr>
+              <td>{{ row.option }}</td>
+              <td>{{ row.match_interface_speed_to_nic }}</td>
               <td>{{ row.plans_per_nic }}</td>
               <td>{{ row.feasible }}</td>
               <td>{{ row.topology }}</td>
@@ -1396,9 +1489,10 @@
     (function () {
       var btnDetail = document.getElementById("diagram_zoom_detail");
       var btnFit = document.getElementById("diagram_zoom_fit");
+      var btnCopy = document.getElementById("diagram_copy_image");
       var wrapDetail = document.getElementById("topology_diagram_detail");
       var wrapFit = document.getElementById("topology_diagram_fit");
-      if (!btnDetail || !btnFit || !wrapDetail || !wrapFit) return;
+      if (!btnDetail || !btnFit || !wrapDetail || !wrapFit || !btnCopy) return;
 
       function showDetail() {
         wrapDetail.hidden = false;
@@ -1420,6 +1514,124 @@
 
       btnDetail.addEventListener("click", showDetail);
       btnFit.addEventListener("click", showFit);
+
+      function parseViewBox(svgEl) {
+        var vb = svgEl.getAttribute("viewBox") || "";
+        var parts = vb.trim().split(/[ ,]+/);
+        if (parts.length !== 4) return null;
+        var w = parseFloat(parts[2]);
+        var h = parseFloat(parts[3]);
+        if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return null;
+        return { width: w, height: h };
+      }
+
+      function svgElementToPngBlob(svgEl, scaleFactor) {
+        var dims = parseViewBox(svgEl);
+        if (!dims) return Promise.resolve(null);
+
+        var scale = scaleFactor || 2;
+        var canvas = document.createElement("canvas");
+        canvas.width = Math.round(dims.width * scale);
+        canvas.height = Math.round(dims.height * scale);
+        var ctx = canvas.getContext("2d");
+        if (!ctx) return Promise.resolve(null);
+
+        // Clone so we can safely set width/height (some browsers render SVGs better that way).
+        var cloned = svgEl.cloneNode(true);
+        cloned.setAttribute("width", String(dims.width));
+        cloned.setAttribute("height", String(dims.height));
+        var serialized = new XMLSerializer().serializeToString(cloned);
+
+        var blob = new Blob([serialized], { type: "image/svg+xml;charset=utf-8" });
+        var url = URL.createObjectURL(blob);
+
+        return new Promise(function (resolve) {
+          var img = new Image();
+          img.onload = function () {
+            try {
+              ctx.setTransform(scale, 0, 0, scale, 0, 0);
+              ctx.clearRect(0, 0, dims.width, dims.height);
+              ctx.drawImage(img, 0, 0, dims.width, dims.height);
+              canvas.toBlob(function (pngBlob) {
+                URL.revokeObjectURL(url);
+                resolve(pngBlob);
+              }, "image/png");
+            } catch (e) {
+              URL.revokeObjectURL(url);
+              resolve(null);
+            }
+          };
+          img.onerror = function () {
+            URL.revokeObjectURL(url);
+            resolve(null);
+          };
+          img.src = url;
+        });
+      }
+
+      function getVisibleDiagramSvg() {
+        var wrap = wrapDetail.hidden ? wrapFit : wrapDetail;
+        if (!wrap) return null;
+        var svg = wrap.querySelector("svg");
+        return svg || null;
+      }
+
+      async function copyDiagramImage() {
+        var originalText = btnCopy.textContent;
+        btnCopy.disabled = true;
+        btnCopy.textContent = "Copying...";
+
+        try {
+          if (!navigator.clipboard || !window.ClipboardItem) {
+            // Clipboard image support is not available; download PNG instead.
+            var svgElFallback = getVisibleDiagramSvg();
+            if (!svgElFallback) throw new Error("No diagram SVG found");
+            var pngBlobFallback = await svgElementToPngBlob(svgElFallback, 2);
+            if (!pngBlobFallback) throw new Error("PNG conversion failed");
+
+            var pngUrl = URL.createObjectURL(pngBlobFallback);
+            var a = document.createElement("a");
+            a.href = pngUrl;
+            a.download = "topology-diagram.png";
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            window.setTimeout(function () {
+              URL.revokeObjectURL(pngUrl);
+            }, 5000);
+
+            btnCopy.textContent = "Downloaded PNG";
+            window.setTimeout(function () {
+              btnCopy.textContent = originalText;
+              btnCopy.disabled = false;
+            }, 1200);
+            return;
+          }
+
+          var svgEl = getVisibleDiagramSvg();
+          if (!svgEl) throw new Error("No diagram SVG found");
+
+          var pngBlob = await svgElementToPngBlob(svgEl, 2);
+          if (!pngBlob) throw new Error("PNG conversion failed");
+
+          var clipboardItem = new ClipboardItem({ "image/png": pngBlob });
+          await navigator.clipboard.write([clipboardItem]);
+
+          btnCopy.textContent = "Copied!";
+          window.setTimeout(function () {
+            btnCopy.textContent = originalText;
+            btnCopy.disabled = false;
+          }, 1200);
+        } catch (e) {
+          btnCopy.textContent = "Copy failed";
+          window.setTimeout(function () {
+            btnCopy.textContent = originalText;
+            btnCopy.disabled = false;
+          }, 2000);
+        }
+      }
+
+      btnCopy.addEventListener("click", copyDiagramImage);
     })();
   </script>
 </body>

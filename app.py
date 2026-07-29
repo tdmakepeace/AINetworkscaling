@@ -49,6 +49,16 @@ class DesignInputs:
     super_spine_speed: int = 0  # 0 = not used, else 800 or 1600
     plans_per_nic: int = 0  # 0, 1, 2, or 4; 0 = all NICs in one plan
     rail_design: bool = False
+    # Cable ratio controlling how many leaf ports are allocated down to nodes
+    # vs up to spines. Format: "<down>:<up>" where values are positive.
+    # Example: "1:1.16" means up uses ~1.16x the ports of down.
+    leaf_spine_ratio: str = "1:1"
+    # Cable ratio controlling how many spine ports are allocated down to leaves
+    # vs up to super-spines. Format: "<down>:<up>".
+    spine_super_ratio: str = "1:1"
+    # If enabled, fabric interfaces (leaf<->spine and spine<->super-spine)
+    # use NIC-speed breakout lanes even when both switch ports are faster.
+    match_interface_speed_to_nic: bool = False
 
 
 @dataclass
@@ -115,24 +125,31 @@ class DesignResult:
 
 
 @dataclass
-class BOMCableLine:
-    quantity: int
-    specification: str
+class BOMConnectionDetail:
+    """Optics assemblies (physical) vs logical cable/link count for one hop."""
+
+    optics_count: int = 0
+    optics_label: str = ""
+    cables_count: int = 0
 
 
 @dataclass
 class BOMLayer:
-    """One fabric layer: switch count/spec and cable lines for that hop."""
+    """One fabric layer: switches plus south/north interface breakdown."""
 
     title: str
     switch_quantity: int
     switch_specification: str
-    cable_lines: list[BOMCableLine] = field(default_factory=list)
+    south_to: str = ""
+    north_to: str = ""
+    south: BOMConnectionDetail = field(default_factory=BOMConnectionDetail)
+    north: BOMConnectionDetail = field(default_factory=BOMConnectionDetail)
     layer_note: str = ""
 
 
 @dataclass
 class BillOfMaterials:
+    context_line: str
     super_spine: BOMLayer
     spine: BOMLayer
     leaf: BOMLayer
@@ -150,10 +167,33 @@ def _compute_fanouts(a: int, b: int) -> tuple[int, int]:
     return 1, max(1, b // a)
 
 
+def _compute_matched_interface_fanouts(
+    speed_a: int, speed_b: int, interface_speed: int
+) -> tuple[int, int]:
+    """Return fanouts when both ends should expose `interface_speed` lanes."""
+    if speed_a < interface_speed or speed_b < interface_speed:
+        raise ValueError(
+            f"Matched interface speed {_fmt_speed(interface_speed)} requires both "
+            f"ends to be at least {_fmt_speed(interface_speed)}."
+        )
+    if speed_a % interface_speed != 0 or speed_b % interface_speed != 0:
+        raise ValueError(
+            f"Matched interface speed {_fmt_speed(interface_speed)} must divide both "
+            f"{_fmt_speed(speed_a)} and {_fmt_speed(speed_b)}."
+        )
+    return speed_a // interface_speed, speed_b // interface_speed
+
+
 def _cable_label(
     speed_a: int, fanout_a_to_b: int, speed_b: int, fanout_b_to_a: int
 ) -> str:
     """Build a cable-type label like '800G-800G' or '800G-2x400G'."""
+    if fanout_a_to_b > 1 and fanout_b_to_a > 1:
+        lane_speed_a = speed_a // fanout_a_to_b
+        lane_speed_b = speed_b // fanout_b_to_a
+        if lane_speed_a == lane_speed_b:
+            lane = _fmt_speed(lane_speed_a)
+            return f"{lane}-{lane}"
     a = _fmt_speed(speed_a)
     b = _fmt_speed(speed_b)
     if fanout_a_to_b > 1:
@@ -164,10 +204,40 @@ def _cable_label(
     return f"{a}-{b}"
 
 
+def _format_bom_optic_label(label: str) -> str:
+    """Format cable labels for BOM display, e.g. 800G-2x400G -> 800G - 2x400G."""
+    if "-" not in label:
+        return label
+    left, right = label.split("-", 1)
+    return f"{left} - {right}"
+
+
+def _bom_connection_detail(
+    logical_links: int,
+    speed_a: int,
+    fanout_a_to_b: int,
+    speed_b: int,
+    fanout_b_to_a: int,
+) -> BOMConnectionDetail:
+    if logical_links <= 0:
+        return BOMConnectionDetail()
+    optics_count = _cable_count(logical_links, fanout_a_to_b, fanout_b_to_a)
+    optics_label = _format_bom_optic_label(
+        _cable_label(speed_a, fanout_a_to_b, speed_b, fanout_b_to_a)
+    )
+    return BOMConnectionDetail(
+        optics_count=optics_count,
+        optics_label=optics_label,
+        cables_count=logical_links,
+    )
+
+
 def _cable_count(total_links: int, fanout_a_to_b: int, fanout_b_to_a: int) -> int:
     """Number of physical cables carrying `total_links` logical links,
     given breakout fanouts between the two ends.
     """
+    if fanout_a_to_b > 1 and fanout_b_to_a > 1:
+        return total_links
     per_cable = max(1, fanout_a_to_b, fanout_b_to_a)
     return math.ceil(total_links / per_cable)
 
@@ -178,6 +248,35 @@ MIN_TIER_SWITCHES = 2
 
 def _clampTierSwitchCount(count: int) -> int:
     return max(count, MIN_TIER_SWITCHES)
+
+
+def _parsePortRatio(ratio: str) -> tuple[float, float]:
+    """
+    Parse a "<down>:<up>" style ratio such as "1:1.16".
+
+    Returns (down, up) as positive floats.
+    """
+    try:
+        down_s, up_s = ratio.strip().split(":")
+        down = float(down_s)
+        up = float(up_s)
+    except ValueError as exc:
+        raise ValueError(f"Invalid ratio format: {ratio!r}. Expected '<down>:<up>'.") from exc
+    if down <= 0 or up <= 0:
+        raise ValueError(f"Ratio values must be > 0. Got {ratio!r}.")
+    return down, up
+
+
+def _floor_to_multiple(value: float, multiple: int) -> int:
+    if multiple <= 1:
+        return int(math.floor(value))
+    return int((math.floor(value) // multiple) * multiple)
+
+
+def _ceil_to_multiple(value: float, multiple: int) -> int:
+    if multiple <= 1:
+        return int(math.ceil(value))
+    return int(math.ceil(value / multiple) * multiple)
 
 
 def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
@@ -216,9 +315,16 @@ def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
 
     # Breakouts
     leaf_breakout = inp.leaf_speed // nic_plan_speed
-    leaf_to_spine_fanout, spine_to_leaf_fanout = _compute_fanouts(
-        inp.leaf_speed, inp.spine_speed
-    )
+    if inp.match_interface_speed_to_nic:
+        leaf_to_spine_fanout, spine_to_leaf_fanout = (
+            _compute_matched_interface_fanouts(
+                inp.leaf_speed, inp.spine_speed, nic_plan_speed
+            )
+        )
+    else:
+        leaf_to_spine_fanout, spine_to_leaf_fanout = _compute_fanouts(
+            inp.leaf_speed, inp.spine_speed
+        )
 
     # --- Plans note -------------------------------------------------------
     if single_plan_mode:
@@ -245,19 +351,87 @@ def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
     max_gpus_one_switch = inp.leaf_ports * leaf_breakout
     # Rail needs at least one leaf per GPU in a node (gpus_per_node leaf switches).
     rail_needs_leaf_row = inp.rail_design and inp.gpus_per_node > 1
-    if gpus_per_plane <= max_gpus_one_switch and not rail_needs_leaf_row:
+    if not inp.rail_design:
+        endpoints_per_node = inp.gpus_per_node * (
+            inp.nics_per_gpu if single_plan_mode else 1
+        )
+        ports_per_node = math.ceil(endpoints_per_node / leaf_breakout)
+        nodes_total = math.ceil(inp.num_gpus / inp.gpus_per_node)
+        max_nodes_one_switch = inp.leaf_ports // ports_per_node
+        can_single_switch = (
+            gpus_per_plane <= max_gpus_one_switch
+            and nodes_total <= max_nodes_one_switch
+            and not rail_needs_leaf_row
+            and inp.leaf_spine_ratio == "1:1"
+        )
+    else:
+        can_single_switch = (
+            gpus_per_plane <= max_gpus_one_switch
+            and not rail_needs_leaf_row
+            and inp.leaf_spine_ratio == "1:1"
+        )
+
+    if can_single_switch:
         return _single_switch_result(
             inp, num_planes, gpus_per_plane, leaf_breakout, notes
         )
 
-    # --- Leaf port split for 1:1 ----------------------------------------
-    downlink_ports = inp.leaf_ports // 2
-    uplink_ports = inp.leaf_ports - downlink_ports
-    if downlink_ports == 0 or uplink_ports == 0:
-        return _infeasible(inp, notes + ["Leaf radix too small to split."])
+    # --- Leaf port split via leaf_spine_ratio ---------------------------
+    down_ratio, up_ratio = _parsePortRatio(inp.leaf_spine_ratio)
+
+    downlink_ports_ideal = inp.leaf_ports * down_ratio / (down_ratio + up_ratio)
+
+    if inp.rail_design:
+        # Rail allows splitting a node across leaf switches, so only enforce
+        # that both tiers have at least one port.
+        downlink_ports = max(1, int(math.floor(downlink_ports_ideal)))
+        uplink_granularity = max(1, leaf_to_spine_fanout)
+        uplink_ports = _ceil_to_multiple(
+            downlink_ports * up_ratio / down_ratio, uplink_granularity
+        )
+        max_uplink_ports = inp.leaf_ports - downlink_ports
+        if uplink_ports > max_uplink_ports:
+            uplink_ports = _floor_to_multiple(max_uplink_ports, uplink_granularity)
+    else:
+        # Non-rail: a switch can only connect to whole node NIC ports.
+        endpoints_per_node = inp.gpus_per_node * (
+            inp.nics_per_gpu if single_plan_mode else 1
+        )
+        ports_per_node = math.ceil(endpoints_per_node / leaf_breakout)
+        downlink_ports = _floor_to_multiple(downlink_ports_ideal, ports_per_node)
+        uplink_granularity = max(1, leaf_to_spine_fanout)
+        uplink_ports = _ceil_to_multiple(
+            downlink_ports * up_ratio / down_ratio, uplink_granularity
+        )
+        max_uplink_ports = inp.leaf_ports - downlink_ports
+        if uplink_ports > max_uplink_ports:
+            uplink_ports = _floor_to_multiple(max_uplink_ports, uplink_granularity)
+
+    if downlink_ports <= 0 or uplink_ports <= 0:
+        return _infeasible(
+            inp,
+            notes
+            + ["Leaf radix too small to split given leaf-to-spine ratio."],
+        )
 
     gpus_per_leaf = downlink_ports * leaf_breakout
-    leaves_per_plane = math.ceil(gpus_per_plane / gpus_per_leaf)
+
+    if inp.rail_design:
+        leaves_per_plane = math.ceil(gpus_per_plane / gpus_per_leaf)
+    else:
+        endpoints_per_node = inp.gpus_per_node * (
+            inp.nics_per_gpu if single_plan_mode else 1
+        )
+        ports_per_node = math.ceil(endpoints_per_node / leaf_breakout)
+        nodes_per_leaf = downlink_ports // ports_per_node
+        if nodes_per_leaf <= 0:
+            return _infeasible(
+                inp,
+                notes
+                + ["Non-rail node ports do not fit on even one leaf switch."],
+            )
+        endpoints_capacity_per_leaf = nodes_per_leaf * endpoints_per_node
+        leaves_per_plane = math.ceil(gpus_per_plane / endpoints_capacity_per_leaf)
     if inp.rail_design:
         rail_multiple = inp.gpus_per_node
         leaves_per_plane = max(leaves_per_plane, rail_multiple)
@@ -405,10 +579,41 @@ def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
         )
 
     # --- 3-tier (super-spine) sizing ------------------------------------
-    # Fat-tree-style: each spine uses half its ports down to leaves, half up
-    # to the super-spine layer (1:1 bandwidth across the spine).
-    spine_ports_down = inp.spine_ports // 2
-    spine_ports_up = inp.spine_ports - spine_ports_down
+    down_ratio, up_ratio = _parsePortRatio(inp.spine_super_ratio)
+
+    # Split spine ports between "down" (to leaves) and "up" (to super-spines)
+    # using spine_super_ratio.
+    #
+    # We intentionally allow some ports to remain unused when rounding to
+    # integer ports and to fanout-aligned multiples.
+    if inp.match_interface_speed_to_nic:
+        spine_to_super_fanout, super_to_spine_fanout = (
+            _compute_matched_interface_fanouts(
+                inp.spine_speed, inp.super_spine_speed, nic_plan_speed
+            )
+        )
+    else:
+        spine_to_super_fanout, super_to_spine_fanout = _compute_fanouts(
+            inp.spine_speed, inp.super_spine_speed
+        )
+
+    spine_ports_down_ideal = inp.spine_ports * down_ratio / (down_ratio + up_ratio)
+    spine_ports_down = max(1, int(math.floor(spine_ports_down_ideal)))
+    uplink_granularity = max(1, spine_to_super_fanout)
+    spine_ports_up = _ceil_to_multiple(
+        spine_ports_down * up_ratio / down_ratio, uplink_granularity
+    )
+    max_spine_ports_up = inp.spine_ports - spine_ports_down
+    if spine_ports_up > max_spine_ports_up:
+        spine_ports_up = _floor_to_multiple(max_spine_ports_up, uplink_granularity)
+
+    if spine_ports_up <= 0:
+        return _infeasible(
+            inp,
+            notes
+            + ["Spine radix too small to split given spine-to-super-spine ratio."],
+        )
+
     leaves_per_pod = spine_ports_down * spine_to_leaf_fanout
 
     # Each pod uses a full spine-leaf mesh without bundling.
@@ -423,9 +628,6 @@ def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
     # number of super-spines needed to absorb all spine uplinks. Spines do
     # not need to fully mesh with every super-spine - Clos non-blocking
     # holds as long as aggregate capacity and path diversity are sufficient.
-    spine_to_super_fanout, super_to_spine_fanout = _compute_fanouts(
-        inp.spine_speed, inp.super_spine_speed
-    )
     total_spine_super_links = (
         spines_per_plane_3t * spine_ports_up * spine_to_super_fanout
     )
@@ -479,20 +681,31 @@ def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
     notes.append(
         f"Each spine splits its {inp.spine_ports} ports as "
         f"{spine_ports_down} down (to pod leaves) + {spine_ports_up} up "
-        "(to super-spines) for 1:1 through the spine."
+        f"(to super-spines) for spine-to-super ratio {inp.spine_super_ratio}."
     )
-    if spine_to_super_fanout > 1:
+    if inp.match_interface_speed_to_nic and (
+        spine_to_super_fanout > 1 or super_to_spine_fanout > 1
+    ):
         notes.append(
-            f"Spine-to-super breakout: each {inp.spine_speed}G spine port "
-            f"splits into {spine_to_super_fanout} x {inp.super_spine_speed}G "
-            "super-spine links."
+            "Fabric interface speed matched to NIC speed: "
+            f"spine↔super-spine uses {_fmt_speed(nic_plan_speed)} lanes, with each "
+            f"{_fmt_speed(inp.spine_speed)} spine port breaking out {spine_to_super_fanout}:1 "
+            f"and each {_fmt_speed(inp.super_spine_speed)} super-spine port breaking out "
+            f"{super_to_spine_fanout}:1."
         )
-    if super_to_spine_fanout > 1:
-        notes.append(
-            f"Super-to-spine breakout: each {inp.super_spine_speed}G super-spine "
-            f"port splits into {super_to_spine_fanout} x {inp.spine_speed}G "
-            "spine-side links."
-        )
+    else:
+        if spine_to_super_fanout > 1:
+            notes.append(
+                f"Spine-to-super breakout: each {inp.spine_speed}G spine port "
+                f"splits into {spine_to_super_fanout} x {inp.super_spine_speed}G "
+                "super-spine links."
+            )
+        if super_to_spine_fanout > 1:
+            notes.append(
+                f"Super-to-spine breakout: each {inp.super_spine_speed}G super-spine "
+                f"port splits into {super_to_spine_fanout} x {inp.spine_speed}G "
+                "spine-side links."
+            )
     links_per_spine_super_pair = (
         max(1, spine_reach // super_spines_per_plane) if super_spines_per_plane else 0
     )
@@ -539,7 +752,17 @@ def _single_switch_result(
     notes: list[str],
 ) -> DesignResult:
     """All GPU NICs in a plane fit on one leaf. No spine layer required."""
-    downlink_ports_used = math.ceil(gpus_per_plane / leaf_breakout)
+    if inp.rail_design:
+        downlink_ports_used = math.ceil(gpus_per_plane / leaf_breakout)
+    else:
+        # Non-rail: map whole node NIC ports onto the single leaf.
+        single_plan_mode = inp.plans_per_nic == 0
+        endpoints_per_node = inp.gpus_per_node * (
+            inp.nics_per_gpu if single_plan_mode else 1
+        )
+        ports_per_node = math.ceil(endpoints_per_node / leaf_breakout)
+        nodes_total = math.ceil(inp.num_gpus / inp.gpus_per_node)
+        downlink_ports_used = nodes_total * ports_per_node
     plane = PlaneDesign(
         nic_speed_raw=inp.nic_speed,
         nic_speed=inp.nic_speed // max(1, inp.plans_per_nic),
@@ -699,38 +922,114 @@ def _compute_cables(
     return cables
 
 
+def _bom_port_breakout_detail(
+    port_links: int,
+    port_speed: int,
+    lane_speed: int,
+) -> BOMConnectionDetail:
+    """Physical optics at port speed, logical cables at lane speed (e.g. 800G -> 2x400G)."""
+    if port_links <= 0 or port_speed <= 0 or lane_speed <= 0:
+        return BOMConnectionDetail()
+    if port_speed == lane_speed:
+        label = _format_bom_optic_label(f"{_fmt_speed(port_speed)}-{_fmt_speed(lane_speed)}")
+        return BOMConnectionDetail(
+            optics_count=port_links,
+            optics_label=label,
+            cables_count=port_links,
+        )
+    if port_speed % lane_speed != 0:
+        return BOMConnectionDetail()
+    lane_mult = port_speed // lane_speed
+    label = _format_bom_optic_label(
+        f"{_fmt_speed(port_speed)}-{lane_mult}x{_fmt_speed(lane_speed)}"
+    )
+    return BOMConnectionDetail(
+        optics_count=port_links,
+        optics_label=label,
+        cables_count=port_links * lane_mult,
+    )
+
+
 def build_bill_of_materials(result: DesignResult) -> BillOfMaterials:
-    """Layered BOM: switches (count + radix/speed) and cables (count + optic type label)."""
+    """Layered BOM with per-tier switch counts and south/north optics vs cables."""
     inp = result.inputs
     plane = result.plane
+    num_planes = result.num_planes
 
-    def cable_groups_between(end_a: str, end_b: str) -> list[CableGroup]:
-        return [c for c in result.cables if c.end_a == end_a and c.end_b == end_b]
-
-    def lines_for(groups: list[CableGroup], hop_description: str) -> list[BOMCableLine]:
-        out: list[BOMCableLine] = []
-        for c in groups:
-            out.append(
-                BOMCableLine(
-                    quantity=c.count,
-                    specification=f"{c.label} — {hop_description}",
-                )
-            )
-        return out
-
-    leaf_groups = cable_groups_between("Leaf", "Node")
-    spine_to_leaf_groups = cable_groups_between("Spine", "Leaf")
-    super_to_spine_groups = cable_groups_between("Super-spine", "Spine")
-
-    leaf_switch_spec = f"{inp.leaf_ports}-port @ {_fmt_speed(inp.leaf_speed)}"
-    spine_switch_spec = f"{inp.spine_ports}-port @ {_fmt_speed(inp.spine_speed)}"
+    leaf_switch_spec = f"{inp.leaf_ports}-port @{_fmt_speed(inp.leaf_speed)}"
+    spine_switch_spec = f"{inp.spine_ports}-port @{_fmt_speed(inp.spine_speed)}"
     super_speed = plane.super_spine_speed
     if result.total_super_spines == 0:
         super_switch_spec = "Not used"
     elif super_speed:
-        super_switch_spec = f"{inp.super_spine_ports}-port @ {_fmt_speed(super_speed)}"
+        super_switch_spec = f"{inp.super_spine_ports}-port @{_fmt_speed(super_speed)}"
     else:
         super_switch_spec = f"{inp.super_spine_ports}-port (speed unset)"
+
+    # --- Leaf-to-node logical links (summed across planes) ---------------------------
+    leaf_node_links = 0
+    if plane.leaves_per_plane > 0:
+        leaf_node_links_per_plane = (
+            inp.num_gpus * inp.nics_per_gpu if inp.plans_per_nic == 0 else inp.num_gpus
+        )
+        leaf_node_links = leaf_node_links_per_plane * num_planes
+
+    # Leaf south always follows leaf-port vs NIC (plan) speed breakout.
+    leaf_south = _bom_connection_detail(
+        leaf_node_links,
+        plane.leaf_speed,
+        plane.leaf_breakout,
+        plane.nic_speed,
+        1,
+    )
+
+    # Spine <-> leaf hop:
+    # - match Yes: model as NIC-speed lanes (e.g. 800G - 2x400G)
+    # - match No: model as native port-speed links (e.g. 800G - 800G)
+    spine_leaf_port_links = 0
+    if plane.leaves_per_plane > 0 and plane.uplink_ports_per_leaf > 0:
+        spine_leaf_port_links = (
+            plane.leaves_per_plane * plane.uplink_ports_per_leaf * num_planes
+        )
+    if inp.match_interface_speed_to_nic:
+        spine_leaf_hop = _bom_port_breakout_detail(
+            spine_leaf_port_links,
+            min(inp.leaf_speed, inp.spine_speed),
+            plane.nic_speed,
+        )
+    else:
+        spine_leaf_hop = _bom_connection_detail(
+            spine_leaf_port_links,
+            plane.leaf_speed,
+            plane.leaf_to_spine_fanout,
+            plane.spine_speed,
+            plane.spine_to_leaf_fanout,
+        )
+    leaf_north = spine_leaf_hop
+    spine_south = spine_leaf_hop
+
+    # Spine <-> super-spine hop follows the same Yes/No rule.
+    super_spine_port_links = 0
+    if plane.uses_super_spine and plane.spines_per_plane > 0:
+        super_spine_port_links = (
+            plane.spines_per_plane * plane.spine_ports_up_to_super * num_planes
+        )
+    if inp.match_interface_speed_to_nic and plane.super_spine_speed > 0:
+        super_spine_hop = _bom_port_breakout_detail(
+            super_spine_port_links,
+            min(inp.spine_speed, inp.super_spine_speed),
+            plane.nic_speed,
+        )
+    else:
+        super_spine_hop = _bom_connection_detail(
+            super_spine_port_links,
+            plane.spine_speed,
+            plane.spine_to_super_fanout,
+            plane.super_spine_speed,
+            plane.super_to_spine_fanout,
+        )
+    spine_north = super_spine_hop
+    super_south = super_spine_hop
 
     super_layer_note = ""
     if result.total_super_spines == 0:
@@ -739,8 +1038,6 @@ def build_bill_of_materials(result: DesignResult) -> BillOfMaterials:
                 "Super-spine layer included in topology model but count is zero "
                 "or design marked infeasible; verify inputs."
             )
-        else:
-            super_layer_note = "Super-spine not used for this design."
 
     spine_layer_note = ""
     if result.total_spines == 0:
@@ -752,16 +1049,33 @@ def build_bill_of_materials(result: DesignResult) -> BillOfMaterials:
             spine_layer_note = (
                 "Spine layer not sized — design infeasible with current inputs."
             )
-        else:
-            spine_layer_note = "No spine switches in this result."
 
     leaf_layer_note = ""
     if result.total_leaves == 0 and not result.feasible:
         leaf_layer_note = (
             "Leaf layer not sized — design infeasible with current inputs."
         )
+    elif result.total_leaves > 0:
+        single_plan_mode = inp.plans_per_nic == 0
+        endpoints_per_node = inp.gpus_per_node * (
+            inp.nics_per_gpu if single_plan_mode else 1
+        )
+        ports_per_node = (
+            math.ceil(endpoints_per_node / plane.leaf_breakout)
+            if plane.leaf_breakout > 0
+            else 0
+        )
+        nodes_per_leaf = (
+            plane.downlink_ports_per_leaf // ports_per_node
+            if ports_per_node > 0
+            else 0
+        )
+        leaf_layer_note = (
+            f"Per leaf (per plan): {nodes_per_leaf} node(s); "
+            f"{plane.downlink_ports_per_leaf} south ports, "
+            f"{plane.uplink_ports_per_leaf} north ports."
+        )
 
-    # Shuffle boxes: multi-plane + NIC-side plan breakout (plans_per_nic > 1).
     shuffle_qty = 0
     shuffle_note = (
         "No shuffle count is assumed in the BOM. If you use multiple parallel "
@@ -769,47 +1083,56 @@ def build_bill_of_materials(result: DesignResult) -> BillOfMaterials:
         "for node-side fan-out; actual materials depend on cable and optic "
         "choices, and many valid options exist."
     )
-    if result.num_planes > 1 and inp.plans_per_nic > 1 and leaf_groups:
-        shuffle_qty = sum(c.count for c in leaf_groups)
+    if result.num_planes > 1 and inp.plans_per_nic > 1 and leaf_node_links > 0:
+        shuffle_qty = leaf_south.optics_count
         shuffle_note = (
             f"Multi-plane ({result.num_planes}) with NIC plan breakout "
             f"(plans_per_nic={inp.plans_per_nic}): shuffle boxes might be needed "
             f"for node-side fan-out into per-plan links. This model’s "
-            f"{shuffle_qty:,} leaf↔node cable(s) is only a planning hint tied to "
+            f"{shuffle_qty:,} leaf↔node optic(s) is only a planning hint tied to "
             f"the breakout math above — not a firm order of materials, because "
             f"real deployments depend on cable and optic choices and there are "
             f"many options."
         )
 
+    context_line = (
+        f"Based on {inp.num_gpus:,} GPU(s) with a {inp.leaf_spine_ratio} "
+        f"leaf-to-spine ratio"
+    )
+    if inp.spine_super_ratio != "1:1":
+        context_line += f" and {inp.spine_super_ratio} spine-to-super-spine ratio"
+    context_line += "."
+
     return BillOfMaterials(
+        context_line=context_line,
         super_spine=BOMLayer(
             title="Super-spine",
             switch_quantity=result.total_super_spines,
             switch_specification=super_switch_spec,
-            cable_lines=lines_for(
-                super_to_spine_groups,
-                "super-spine ↔ spine (optics per cable label)",
-            ),
+            south_to="Spine",
+            north_to="",
+            south=super_south,
+            north=BOMConnectionDetail(),
             layer_note=super_layer_note,
         ),
         spine=BOMLayer(
             title="Spine",
             switch_quantity=result.total_spines,
             switch_specification=spine_switch_spec,
-            cable_lines=lines_for(
-                spine_to_leaf_groups,
-                "spine ↔ leaf (optics per cable label)",
-            ),
+            south_to="Leaf",
+            north_to="Super-spine",
+            south=spine_south,
+            north=spine_north,
             layer_note=spine_layer_note,
         ),
         leaf=BOMLayer(
             title="Leaf",
             switch_quantity=result.total_leaves,
             switch_specification=leaf_switch_spec,
-            cable_lines=lines_for(
-                leaf_groups,
-                "leaf ↔ compute node / NIC (optics per cable label)",
-            ),
+            south_to="node",
+            north_to="Spine",
+            south=leaf_south,
+            north=leaf_north,
             layer_note=leaf_layer_note,
         ),
         shuffle_box_quantity=shuffle_qty,
@@ -874,6 +1197,7 @@ def _add_common_notes(
     gpus_per_leaf: int,
     num_planes: int,
 ) -> None:
+    nic_plan_speed = inp.nic_speed if inp.plans_per_nic == 0 else inp.nic_speed // inp.plans_per_nic
     if leaf_breakout > 1:
         notes.append(
             f"Leaf-to-NIC breakout: each {inp.leaf_speed}G leaf port splits "
@@ -887,19 +1211,30 @@ def _add_common_notes(
         notes.append(
             "Single-plan mode: all NICs per GPU are placed in one fabric (no per-NIC breakout plans)."
         )
-    if leaf_to_spine_fanout > 1:
+    if inp.match_interface_speed_to_nic and (
+        leaf_to_spine_fanout > 1 or spine_to_leaf_fanout > 1
+    ):
         notes.append(
-            f"Leaf-to-spine breakout: each {inp.leaf_speed}G leaf uplink "
-            f"splits into {leaf_to_spine_fanout} x {inp.spine_speed}G links."
+            "Fabric interface speed matched to NIC speed: "
+            f"leaf↔spine uses {_fmt_speed(nic_plan_speed)} lanes, with each "
+            f"{_fmt_speed(inp.leaf_speed)} leaf port breaking out {leaf_to_spine_fanout}:1 "
+            f"and each {_fmt_speed(inp.spine_speed)} spine port breaking out "
+            f"{spine_to_leaf_fanout}:1."
         )
-    if spine_to_leaf_fanout > 1:
-        notes.append(
-            f"Spine-to-leaf breakout: each {inp.spine_speed}G spine port "
-            f"splits into {spine_to_leaf_fanout} x {inp.leaf_speed}G links."
-        )
+    else:
+        if leaf_to_spine_fanout > 1:
+            notes.append(
+                f"Leaf-to-spine breakout: each {inp.leaf_speed}G leaf uplink "
+                f"splits into {leaf_to_spine_fanout} x {inp.spine_speed}G links."
+            )
+        if spine_to_leaf_fanout > 1:
+            notes.append(
+                f"Spine-to-leaf breakout: each {inp.spine_speed}G spine port "
+                f"splits into {spine_to_leaf_fanout} x {inp.leaf_speed}G links."
+            )
     notes.append(
-        f"Leaf port split: {downlink_ports} downlinks + {uplink_ports} "
-        f"uplinks @ {inp.leaf_speed}G = {inp.leaf_ports} ports (1:1)."
+        f"Leaf port split: {downlink_ports} downlinks + {uplink_ports} uplinks = "
+        f"{downlink_ports + uplink_ports} used ports (leaf-to-spine {inp.leaf_spine_ratio})."
     )
     notes.append(
         f"GPUs per leaf (per plan): {gpus_per_leaf} "
@@ -1502,35 +1837,49 @@ DEFAULTS = dict(
     super_spine_speed=0,
     plans_per_nic=0,
     rail_design=False,
+    leaf_spine_ratio="1:1",
+    spine_super_ratio="1:1",
+    match_interface_speed_to_nic=False,
 )
 
+LEAF_SPINE_RATIOS = ("1:1", "1:1.1", "1:1.16", "1:1.20")
+PLANS_PER_NIC_OPTIONS = (0, 1, 2, 4)
 
-def _build_plan_comparison(form: dict[str, int]) -> list[dict[str, str | int]]:
+
+def _build_plan_comparison(form: dict) -> list[dict[str, str | int]]:
+    """Compare plans and match-to-NIC for the selected leaf-to-spine ratio."""
     rows: list[dict[str, str | int]] = []
-    for plans_per_nic in (0, 1, 2, 4):
-        compare_form = dict(form)
-        compare_form["plans_per_nic"] = plans_per_nic
-        compare_input = DesignInputs(**compare_form)
-        compare_result = design_fabric(compare_input)
-        total_cables = sum(c.count for c in compare_result.cables)
-        cable_breakdown = (
-            ", ".join(
-                f"{c.end_a}-{c.end_b}: {c.count:,}" for c in compare_result.cables
+    for match_option, match_value in ((1, False), (2, True)):
+        for plans_per_nic in PLANS_PER_NIC_OPTIONS:
+            compare_form = dict(form)
+            compare_form["plans_per_nic"] = plans_per_nic
+            compare_form["match_interface_speed_to_nic"] = match_value
+            compare_input = DesignInputs(**compare_form)
+            compare_result = design_fabric(compare_input)
+            total_cables = sum(c.count for c in compare_result.cables)
+            cable_breakdown = (
+                ", ".join(
+                    f"{c.end_a}-{c.end_b}: {c.count:,}"
+                    for c in compare_result.cables
+                )
+                or "-"
             )
-            or "-"
-        )
-        rows.append(
-            {
-                "plans_per_nic": plans_per_nic,
-                "feasible": "Yes" if compare_result.feasible else "No",
-                "topology": compare_result.topology,
-                "leaf_switches": compare_result.total_leaves,
-                "spine_switches": compare_result.total_spines,
-                "super_spine_switches": compare_result.total_super_spines,
-                "total_cables": total_cables,
-                "cable_breakdown": cable_breakdown,
-            }
-        )
+            rows.append(
+                {
+                    "option": match_option,
+                    "match_interface_speed_to_nic": (
+                        "Yes" if match_value else "No"
+                    ),
+                    "plans_per_nic": plans_per_nic,
+                    "feasible": "Yes" if compare_result.feasible else "No",
+                    "topology": compare_result.topology,
+                    "leaf_switches": compare_result.total_leaves,
+                    "spine_switches": compare_result.total_spines,
+                    "super_spine_switches": compare_result.total_super_spines,
+                    "total_cables": total_cables,
+                    "cable_breakdown": cable_breakdown,
+                }
+            )
     return rows
 
 
@@ -1565,6 +1914,11 @@ def index():
                     request.form.get("plans_per_nic") or request.form.get("plans") or 0
                 ),
                 rail_design=request.form.get("rail_design") == "on",
+                leaf_spine_ratio=request.form.get("leaf_spine_ratio", "1:1"),
+                spine_super_ratio=request.form.get("spine_super_ratio", "1:1"),
+                match_interface_speed_to_nic=(
+                    request.form.get("match_interface_speed_to_nic", "no") == "yes"
+                ),
             )
             if form["num_gpus"] <= 0:
                 raise ValueError("Number of GPUs must be positive.")
@@ -1590,6 +1944,17 @@ def index():
                 )
             if form["plans_per_nic"] not in (0, 1, 2, 4):
                 raise ValueError("Plans per NIC must be 0, 1, 2, or 4.")
+            allowed_ratios = set(LEAF_SPINE_RATIOS)
+            if form["leaf_spine_ratio"] not in allowed_ratios:
+                raise ValueError(
+                    "Leaf-to-spine ratio must be one of: 1:1, 1:1.1, 1:1.16, 1:1.20."
+                )
+            if form["spine_super_ratio"] not in allowed_ratios:
+                raise ValueError(
+                    "Spine-to-super-spine ratio must be one of: 1:1, 1:1.1, 1:1.16, 1:1.20."
+                )
+            if not isinstance(form["match_interface_speed_to_nic"], bool):
+                raise ValueError("Match interface speed to NIC must be yes or no.")
             if (
                 form["plans_per_nic"] > 0
                 and form["nic_speed"] % form["plans_per_nic"] != 0

@@ -1,146 +1,308 @@
 # AI Spine-Leaf Network Designer
 
-A **Flask** application that sizes a **non-blocking (1:1)** spine-leaf fabric for AI/GPU clusters, optionally adds a **super-spine** tier when radix limits require it, estimates **physical cable groups**, and renders an **SVG** topology diagram. By default it opens in a **native window** via **pywebview** while serving on `http://127.0.0.1:5000/`.
+A **Flask** web app that sizes a **non-blocking (1:1)** spine-leaf fabric for AI/GPU clusters, optionally adds a **super-spine** tier when radix limits require it, estimates **physical cable groups**, and renders an **SVG** topology diagram. On Windows, it can open in a **native desktop window** via **pywebview** while serving on `http://127.0.0.1:5000/`. In Docker/Podman it runs **browser-only** on port **10000**.
 
-## Features
+---
 
-- **Topologies**: single leaf switch (when a plane fits on one switch), classic two-tier spine-leaf, or three-tier spine / super-spine when spines cannot fan out to enough leaves within radix.
-- **Parallel fabrics**: combines **NICs per GPU** (1–3) with **plans per NIC** (0, 1, 2, or 4). **0** means a **single fabric plan** (all NIC endpoints in one plane). For **1 / 2 / 4**, each physical NIC is broken into that many logical **plan legs** (e.g. 4×100G from one 400G NIC). **Every GPU participates in every parallel plan** at the per-plan link speed; fabric sizing uses the **full GPU count per plan**, not a split of GPUs across plans. Switch and cable **totals** still scale with the number of parallel planes (independent physical fabrics).
-- **Independent port speeds**: **NIC** (400G / 800G), **leaf** (400G / 800G / 1.6T), **spine** (400G / 800G / 1.6T), optional **super-spine** (off, 800G, or 1.6T). Faster ports assume **breakout** when connecting to slower endpoints. Cable labels use a **faster-side-first** breakout form (e.g. **800G-2x400G** for spine–leaf).
-- **Cluster shape**: total **GPUs**, **GPUs per node** (for node counts and cabling to hosts).
-- **Compare plans**: second submit button runs the design for **plans_per_nic** values **0, 1, 2, and 4** with the same inputs and opens a **modal** with a side-by-side table (feasibility, topology, switch counts, cables).
-- **Bill of materials (BOM)**: after each design, a **layered BOM** lists super-spine / spine / leaf **switch counts** (radix and speed) and **cable quantities** with the same optic/breakout labels as the cable summary. Super-spine switch radix is independently configurable from spine radix. **Shuffle boxes** are described as **might be needed** when multi-plane and NIC plan breakout apply; counts are a **planning hint**, not a firm order (real builds depend on cable and optic choices).
+## Table of contents
 
-## Inputs
+- [Quick start](#quick-start)
+  - [Virtual environment](#virtual-environment)
+  - [Docker / Podman](#docker--podman)
+  - [Native (from source)](#native-from-source)
+  - [Windows packaged executable](#windows-packaged-executable)
+- [Using the application](#using-the-application)
+  - [Input panel](#input-panel)
+  - [Design fabric](#design-fabric)
+  - [Compare plans](#compare-plans)
+  - [Topology diagram](#topology-diagram)
+  - [Bill of materials](#bill-of-materials)
+  - [Cables and design notes](#cables-and-design-notes)
+  - [Rail design preview](#rail-design-preview)
+- [Backend functions](#backend-functions)
+- [Design assumptions](#design-assumptions)
+- [Testing](#testing)
+- [Project layout](#project-layout)
 
-| Field | Meaning |
-|--------|--------|
-| Number of GPUs | Total GPUs in the cluster |
-| GPUs per node | Drives server/node counts in outputs |
-| NICs per GPU | 1, 2, or 3; when plans per NIC is not 0, multiplies the number of **parallel physical fabrics** (each NIC × each plan leg). |
-| Ports per spine switch | Spine switch radix |
-| Ports per super-spine switch | Super-spine switch radix (used when a 3-tier design is required) |
-| Ports per leaf switch | Leaf switch radix |
-| NIC / leaf / spine speed | As validated in the form (see `app.py`) |
-| Super-spine speed | Disabled, or 800G / 1.6T when a third tier is needed |
-| Plans per NIC | **0** = single plan (all NICs in one fabric); **1, 2, or 4** = that many logical legs per physical NIC (NIC speed must divide evenly). Each plan is sized for **all GPUs** on that leg’s speed (breakout/shuffle from the NIC to the leaf), not “GPUs ÷ number of plans.” |
+---
 
-## Outputs
+## Quick start
 
-- Counts of **leaf**, **spine**, and **super-spine** switches (when used), plus **nodes**
-- Per-plane port usage, link bundling, and design **notes**
-- **Cable group** summary (counts and types, e.g. mixed-speed breakout labels)
-- **Bill of materials** by layer (switches + cables), plus optional shuffle-box guidance
-- **Feasibility** warnings when radix or speed rules cannot be met
-- **SVG** topology sketch
+### Virtual environment
 
-## Design assumptions
+Use a virtual environment for **native runs**, **tests**, and **local development**. Docker/Podman and the packaged `.exe` do not require a local venv on the host.
 
-- Two-tier: every leaf connects to every spine in a plane; the tool picks a **downlink/uplink port split** on leaves and may **bundle** multiple links per leaf–spine pair to reduce spine count within spine radix.
-- **1:1**: aggregate bandwidth from GPUs to the fabric is not oversubscribed on the uplink path (see in-app notes for the specific inequality used).
-- Speed relationships: leaf speed must be at least the effective per-plan NIC speed and an integer multiple of it; allowed speeds are consistent with **400G** base rates.
-- **Multi-plan sizing**: parallel plans are **separate fabrics**, but the model assumes **each GPU is present in each plan** on its own sub-link (e.g. the same GPU reaches leaf resources in plan 1…N via NIC breakout). Design notes and counts reflect that model.
-- If a design cannot fit on one spine layer, **super-spine** is used only when configured and the logic in `design_fabric` can place a third tier; otherwise the result is marked **infeasible** with explanatory notes.
+**Requirements:** Python **3.12+** (matches the Docker image). Runtime dependencies are in [`requirements.txt`](requirements.txt): **Flask**, **pywebview** (native window only).
 
-## Requirements
+**Windows (PowerShell)** — from the project root:
 
-- Python 3 with `pip` (or use your usual venv workflow). If you use **uv**, you can run `uv pip install -r requirements.txt` instead of `pip install`.
-
-Dependencies are listed in `requirements.txt` (Flask, pywebview).
-
-## Running
-
-### Install
-
-```bash
+```powershell
+cd "C:\path\to\AInetworkingscaling"
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-For **tests** (optional), install **pytest** in the same environment (for example `pip install pytest`) and run `pytest` from the repository root (see `pytest.ini`).
-
-### Docker
-
-#### Docker build and start
-
-From the project root (`/apps/NGINX` on the host):
-
-Build/rebuild image:
+**macOS / Linux** — from the project root:
 
 ```bash
-docker compose build --no-cache
+cd /path/to/AInetworkingscaling
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-Start container:
+If you use **uv**, activate the venv first, then:
 
 ```bash
+uv pip install -r requirements.txt
+```
+
+For **tests**, with the venv still active:
+
+```bash
+pip install pytest
+pytest
+```
+
+### Docker / Podman
+
+The container serves the app with Flask on **port 10000** (no pywebview inside the container). Open **http://localhost:10000/** in a browser.
+
+**Docker Compose** (from the project root):
+
+```bash
+# Build
+docker compose build
+
+# Start in background
 docker compose up -d
-```
 
-Restart after config/page changes:
-
-```bash
+# Restart after code changes
 docker compose restart
-```
 
-Stop container:
-
-```bash
+# Stop
 docker compose down
 ```
 
-### Windows
+**Docker without Compose:**
 
-**Option A — packaged executable**
+```bash
+docker build -t ainetwork-designer .
+docker run --rm -p 10000:10000 --name ainetwork-designer ainetwork-designer
+```
 
-- Run **`output\AIScaling.exe`** from the repository (or copy that folder elsewhere and run the `.exe` there).
+**Podman equivalents:**
 
-**Option B — from source**
+```bash
+podman build -t ainetwork-designer .
+podman run --rm -p 10000:10000 --name ainetwork-designer ainetwork-designer
+```
 
-Activate your virtual environment, then start the app, for example:
+Or use `podman compose` in place of `docker compose` if your environment provides it.
+
+### Native (from source)
+
+Create and activate the [virtual environment](#virtual-environment) first, then start the app.
+
+#### Windows
+
+**Option A — desktop window (default)**
+
+With `.venv` active:
 
 ```powershell
-cd "C:\path\to\AInetworkingscaling"
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
 python app.py
 ```
 
-Or without activating the venv:
+A window titled **AI Cable Calculator** opens once the server is ready. You can also browse to **http://127.0.0.1:5000/**.
 
-```powershell
-cd "C:\path\to\AInetworkingscaling"
-.\.venv\Scripts\python.exe app.py
+**Option B — browser only**
+
+In `app.py`, in the `if __name__ == "__main__":` block, set:
+
+```python
+browser_only = "True"
 ```
 
-- With the default settings, a desktop window titled **AI Cable Calculator** should open once the server is ready.
-- You can also open **http://127.0.0.1:5000/** in a browser (the dev server binds to `0.0.0.0`).
+With `.venv` active, run `python app.py` and use **http://127.0.0.1:5000/**.
 
-### macOS and Linux
+#### macOS and Linux
 
-**Browser-only (simplest on many systems)**
+**Browser only (simplest)**
 
-- In `app.py`, in the `if __name__ == "__main__":` block, set:
+Set `browser_only = "True"` in `app.py` (same as above). With `.venv` active:
 
-  `browser_only = "True"`
+```bash
+python app.py
+```
 
-  (The code compares this variable to the string **`"True"`**.)
+Open **http://127.0.0.1:5000/**.
 
-- Then run `python app.py` and use your browser at **http://127.0.0.1:5000/**.
+**Native pywebview window (Linux)**
 
-**Native pywebview window on Linux**
+Install GTK/WebKit dependencies that pywebview needs, for example on Debian/Ubuntu:
 
-- If you want the embedded window instead of a browser, install GTK/WebKit pieces that **pywebview** can use, for example on Debian/Ubuntu:
+```bash
+sudo apt install python3-gi python3-gi-cairo gir1.2-webkit2-4.0
+```
 
-  ```bash
-  sudo apt install python3-gi python3-gi-cairo gir1.2-webkit2-4.0
-  ```
+Keep `browser_only = "False"`. With `.venv` active, run `python app.py`.
 
-- Keep `browser_only = "False"` (or any value other than `"True"`) and run `python app.py` again.
+### Windows packaged executable
 
-## Example
+A pre-built single-file executable is included at [`output/AIScaling.exe`](output/AIScaling.exe). Copy the `output` folder (or the `.exe` plus bundled assets if you rebuild with PyInstaller) and run the executable. See [`notes.txt`](notes.txt) for PyInstaller / auto-py-to-exe build steps.
 
-With **1024** GPUs, **8** GPUs per node, **1** NIC per GPU, **64**-port leaves and spines, **400G** NICs with **4** plans per NIC (4×100G legs), **400G** leaf ports, and **800G** spine links: each of the four parallel fabrics is sized for **all 1024 GPUs** on that plan’s 100G leg (not 256 GPUs per plan). Depending on radix and breakout, you may get **multi-leaf / spine-leaf** rather than a single collapsed leaf per plan—the UI shows topology, notes, cable groups, and BOM.
+---
 
-With **plans per NIC = 0** (single fabric), the same cluster uses one plane carrying **all NIC endpoints** at full NIC speed.
+## Using the application
 
-For **rail-style** scaling, increase **NICs per GPU** and/or **plans per NIC** to add more **parallel physical fabrics**; each fabric is still sized for the full GPU count at the effective per-plan link rate. Use **Compare plans** to see **0 / 1 / 2 / 4** plans per NIC in one table.
+The UI is a two-column layout: **inputs** on the left, **results** on the right. Submit with **Design fabric** for a single design, or **Compare plans** to open a comparison modal.
+
+### Input panel
+
+Configure cluster size, NIC breakout, switch radix/speed, port ratios, and optional super-spine tier.
+
+| Field | Purpose |
+|--------|---------|
+| **Number of GPUs** | Total GPUs in the cluster |
+| **GPUs per node** | Drives server/node counts in outputs |
+| **NICs per GPU** | 1, 2, or 3; multiplies parallel physical fabrics when combined with plans per NIC |
+| **Plans per NIC** | `0` = single fabric plan; `1`, `2`, or `4` = logical breakout legs per NIC (e.g. 4×100G from one 400G NIC) |
+| **Rail design** | When enabled, models dedicated GPU-to-leaf paths per node (`gpus_per_node` paths per node) |
+| **Ports per leaf / spine / super-spine** | Switch radix at each tier |
+| **NIC / leaf / spine speed** | Independent port speeds (400G, 800G, 1.6T where allowed) |
+| **Match fabric interface speed to NIC speed** | When **Yes**, leaf↔spine and spine↔super-spine use NIC-speed breakout lanes even if switch ports are faster |
+| **Leaf-to-spine ratio** | Port allocation between downlinks (nodes) and uplinks (spines): `1:1`, `1:1.1`, `1:1.16`, `1:1.20` |
+| **Spine-to-super-spine ratio** | Same ratio options for spine uplinks when a third tier is used |
+| **Super-spine speed / ports** | Optional third tier at 800G or 1.6T; used only when a 2-tier design cannot fan out |
+
+![Input form with default 1024-GPU cluster settings](docs/screenshots/01-input-form.png)
+
+### Design fabric
+
+**Design fabric** runs the sizing engine and shows:
+
+- **KPI cards** — nodes, leaf switches, spine switches (and super-spines when used), GPUs per leaf
+- **Topology diagram** — SVG sketch of spines, leaves, and nodes with cable annotations
+- **Bill of materials** — switch counts and optic/cable breakdown by layer
+- **Cable summary** — grouped counts with breakout labels (e.g. `800G-2x400G`)
+- **Design notes** — feasibility, topology choice, bundling, and breakout explanations
+
+Default example: **1024 GPUs**, **8** per node, **64-port** leaf/spine, **400G** NIC, **800G** leaf/spine links, single plan (`plans_per_nic = 0`).
+
+![Design results with KPIs, topology diagram, and BOM header](docs/screenshots/02-design-results.png)
+
+### Compare plans
+
+**Compare plans** evaluates **plans per NIC** values **0, 1, 2, and 4** for both **Match fabric to NIC: No** and **Yes**, using your other inputs. The modal table shows feasibility, topology, switch counts, total cables, and a cable breakdown. Change **Leaf-to-spine ratio** in the modal and click **Update** to re-run the matrix.
+
+![Plans-per-NIC comparison modal](docs/screenshots/04-compare-plans-modal.png)
+
+### Topology diagram
+
+After a design run, the diagram panel includes:
+
+| Control | Action |
+|---------|--------|
+| **Detail** | Zoomed view with representative switch slots |
+| **Fit all** | Entire fabric scaled to fit |
+| **Copy image** | Copy the visible diagram to the clipboard as PNG |
+
+![Topology diagram in fit-all view](docs/screenshots/06-topology-fit-view.png)
+
+Supported topologies:
+
+- **single-switch** — entire plane collapses onto one leaf when radix allows
+- **spine-leaf** — classic two-tier non-blocking fabric
+- **3-tier** — spine pods aggregated by super-spine when spine radix is insufficient
+
+### Bill of materials
+
+The BOM lists **super-spine**, **spine**, and **leaf** layers with:
+
+- Switch quantity and specification (radix @ speed)
+- **Optics** (physical assemblies) and **cables** (logical link counts) south and north
+- **Shuffle boxes** — planning hint when multi-plane NIC breakout may need node-side plan splitting; includes reference diagrams (4×4 and 8×8)
+
+![BOM, cable summary, and design notes](docs/screenshots/03-bom-and-cables.png)
+
+### Cables and design notes
+
+**Cables** aggregates physical cable groups across all parallel plans (planes), labeled by endpoints and breakout form (faster-side-first, e.g. `800G-2x400G`).
+
+**Design notes** explain port splits, link bundling, oversubscription checks, super-spine introduction, and infeasibility reasons.
+
+### Rail design preview
+
+Enable **Rail design** to model one GPU-to-leaf path per GPU on each node. Click **view rail on/off mapping** for a side-by-side explanation of standard vs rail cabling.
+
+![Rail design on/off mapping modal](docs/screenshots/05-rail-design-modal.png)
+
+---
+
+## Backend functions
+
+Core logic lives in [`app.py`](app.py).
+
+| Function | Role |
+|----------|------|
+| `design_fabric(inp: DesignInputs) -> DesignResult` | Public entry point; validates inputs and returns switch counts, cables, notes, topology, and BOM |
+| `_design_fabric_compute(inp)` | Main sizing algorithm: leaf/spine/super-spine counts, port splits, link bundling, multi-plan planes |
+| `build_bill_of_materials(result) -> BillOfMaterials` | Builds layered BOM (super-spine / spine / leaf) with optics and cable details |
+| `_compute_cables(...)` | Derives cable groups and breakout labels between tiers |
+| `render_svg(result, diagram_zoom) -> str` | Renders SVG topology (`detail` or `fit` zoom modes) |
+| `_build_plan_comparison(form) -> list[dict]` | Runs the compare-plans matrix for plans 0/1/2/4 × match-to-NIC yes/no |
+| `index()` | Flask route (`GET`/`POST` `/`) — form handling, validation, template render |
+
+Key datatypes: `DesignInputs`, `DesignResult`, `PlaneDesign`, `CableGroup`, `BillOfMaterials`.
+
+---
+
+## Design assumptions
+
+- **Non-blocking (1:1)** — aggregate GPU bandwidth is not oversubscribed on the uplink path (see in-app design notes for the inequality used).
+- **Two-tier connectivity** — every leaf connects to every spine in a plane; the tool picks downlink/uplink port splits and may **bundle** multiple links per leaf–spine pair to reduce spine count within radix.
+- **Speed rules** — allowed speeds are integer multiples of **400G**; leaf speed ≥ effective per-plan NIC speed; breakout assumed when a port is faster than its peer.
+- **Multi-plan sizing** — parallel plans are **separate physical fabrics**; **every GPU participates in every plan** at the per-plan link speed (NIC breakout / shuffle), not “GPUs ÷ number of plans.”
+- **Super-spine** — third tier is introduced only when configured and `_design_fabric_compute` cannot place the cluster on two tiers; otherwise the result is **infeasible** with explanatory notes.
+- **Port ratios** — `leaf_spine_ratio` and `spine_super_ratio` bias how many ports on a switch face south vs north (`down:up` format).
+
+---
+
+## Testing
+
+Use the [virtual environment](#virtual-environment) setup above (`pip install pytest` is included there). From the repository root with `.venv` active:
+
+```bash
+pytest
+```
+
+Tests cover multi-plan sizing, rail design, spine redundancy, SVG rendering, and related design paths. Configuration is in [`pytest.ini`](pytest.ini).
+
+---
+
+## Project layout
+
+```
+AInetworkingscaling/
+├── app.py                 # Flask app + design engine
+├── templates/index.html   # UI
+├── static/                # Favicon, shuffle-box reference images
+├── tests/                 # pytest suite
+├── Dockerfile             # Container image (port 10000)
+├── docker-compose.yaml
+├── docs/screenshots/      # README screenshots
+├── scripts/               # Maintenance scripts (e.g. screenshot capture)
+└── output/AIScaling.exe   # Optional Windows package
+```
+
+---
+
+## Example scenarios
+
+**Single fabric (plans per NIC = 0)** — 1024 GPUs, 8 per node, 64-port switches, 400G NIC, 800G leaf/spine: one plane at full NIC speed; see default **Design fabric** screenshot above.
+
+**Multi-plan breakout (plans per NIC = 4)** — same cluster with 4×100G legs per 400G NIC: four parallel fabrics, each sized for **all 1024 GPUs** on 100G legs. Use **Compare plans** to contrast 0 / 1 / 2 / 4 side by side.
+
+**Rail scaling** — increase **NICs per GPU** and/or **plans per NIC** for additional parallel fabrics; enable **Rail design** when each GPU needs its own leaf downlink path.
