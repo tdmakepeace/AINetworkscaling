@@ -78,7 +78,14 @@ docker compose build
 # Start in background
 docker compose up -d
 
-# Restart after code changes
+# Rebuild and restart after code changes (app.py, templates, static, etc.)
+docker compose up -d --build
+
+# Clean rebuild (ignore Docker layer cache)
+docker compose build --no-cache
+docker compose up -d
+
+# Restart only — same image, no rebuild (config/env tweaks inside the container)
 docker compose restart
 
 # Stop
