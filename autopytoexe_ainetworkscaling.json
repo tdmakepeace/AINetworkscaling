@@ -18,6 +18,10 @@
    "value": false
   },
   {
+   "optionDest": "icon_file",
+   "value": "C:/Users/tmakepea/OneDrive - Advanced Micro Devices Inc/Documents/Cursor Projects/AInetworkingscaling/static/favicon.ico"
+  },
+  {
    "optionDest": "clean_build",
    "value": false
   },
