@@ -180,6 +180,7 @@ Configure cluster size, NIC breakout, switch radix/speed, port ratios, and optio
 | **Ports per leaf / spine / super-spine** | Switch radix at each tier |
 | **NIC / leaf / spine speed** | Independent port speeds (400G, 800G, 1.6T where allowed) |
 | **Match fabric interface speed to NIC speed** | When **Yes**, leaf↔spine and spine↔super-spine use NIC-speed breakout lanes even if switch ports are faster |
+| **Aggressive sizing (minimum devices)** | **No** (default) is best-practice Clos: even full leaf–spine mesh and at least two spines. **Yes** sizes spines from aggregate port fill only, which can use fewer switches (e.g. 11 leaves / 6 spines vs 11 / 8 for 672 GPUs at 800G switch / 400G NIC) |
 | **Leaf-to-spine ratio** | Port allocation between downlinks (nodes) and uplinks (spines): `1:1`, `1:1.1`, `1:1.16`, `1:1.20` |
 | **Spine-to-super-spine ratio** | Same ratio options for spine uplinks when a third tier is used |
 | **Super-spine speed / ports** | Optional third tier at 800G or 1.6T; used only when a 2-tier design cannot fan out |
@@ -269,7 +270,7 @@ Key datatypes: `DesignInputs`, `DesignResult`, `PlaneDesign`, `CableGroup`, `Bil
 ## Design assumptions
 
 - **Non-blocking (1:1)** — aggregate GPU bandwidth is not oversubscribed on the uplink path (see in-app design notes for the inequality used).
-- **Two-tier connectivity** — every leaf connects to every spine in a plane; the tool picks downlink/uplink port splits and may **bundle** multiple links per leaf–spine pair to reduce spine count within radix.
+- **Two-tier connectivity** — **Best practice** (default): every leaf connects to every spine in a plane with equal link counts; the tool may **bundle** multiple links per leaf–spine pair to reduce spine count within radix, and keeps at least two spines. **Aggressive sizing**: spine count is `ceil(leaf uplinks / spine port capacity)` and may be an incomplete mesh, so fewer switches can suffice.
 - **Speed rules** — allowed speeds are integer multiples of **400G**; leaf speed ≥ effective per-plan NIC speed; breakout assumed when a port is faster than its peer.
 - **Multi-plan sizing** — parallel plans are **separate physical fabrics**; **every GPU participates in every plan** at the per-plan link speed (NIC breakout / shuffle), not “GPUs ÷ number of plans.”
 - **Super-spine** — third tier is introduced only when configured and `_design_fabric_compute` cannot place the cluster on two tiers; otherwise the result is **infeasible** with explanatory notes.
@@ -285,7 +286,7 @@ Use the [virtual environment](#virtual-environment) setup above (`pip install py
 pytest
 ```
 
-Tests cover multi-plan sizing, rail design, spine redundancy, SVG rendering, and related design paths. Configuration is in [`pytest.ini`](pytest.ini).
+Tests cover multi-plan sizing, rail design, spine redundancy, aggressive vs best-practice sizing, SVG rendering, and related design paths. Configuration is in [`pytest.ini`](pytest.ini).
 
 ---
 

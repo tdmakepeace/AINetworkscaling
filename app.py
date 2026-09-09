@@ -59,6 +59,9 @@ class DesignInputs:
     # If enabled, fabric interfaces (leaf<->spine and spine<->super-spine)
     # use NIC-speed breakout lanes even when both switch ports are faster.
     match_interface_speed_to_nic: bool = False
+    # False = best-practice Clos (even full mesh, redundant spine pair).
+    # True = minimum devices from aggregate port fill (may be an incomplete mesh).
+    aggressive_design: bool = False
 
 
 @dataclass
@@ -246,8 +249,76 @@ def _cable_count(total_links: int, fanout_a_to_b: int, fanout_b_to_a: int) -> in
 MIN_TIER_SWITCHES = 2
 
 
-def _clampTierSwitchCount(count: int) -> int:
+def _clampTierSwitchCount(count: int, aggressive: bool = False) -> int:
+    if aggressive:
+        return max(count, 1)
     return max(count, MIN_TIER_SWITCHES)
+
+
+def _size_two_tier_spines(
+    links_per_leaf: int,
+    leaves_per_plane: int,
+    spine_to_leaf_fanout: int,
+    spine_ports: int,
+    aggressive: bool,
+) -> tuple[int, int, int, bool]:
+    """Return (spines_per_plane, links_per_leaf_to_each_spine, ports_used, two_tier_ok).
+
+    Best practice keeps an even full leaf-spine mesh and at least two spines.
+    Aggressive sizes spines from aggregate uplink fill only (minimum devices).
+    """
+    if aggressive:
+        total_links = leaves_per_plane * links_per_leaf
+        spine_link_capacity = spine_ports * spine_to_leaf_fanout
+        spines_per_plane = max(1, math.ceil(total_links / spine_link_capacity))
+        busiest_links = math.ceil(total_links / spines_per_plane)
+        spine_ports_used = math.ceil(busiest_links / spine_to_leaf_fanout)
+        links_per_leaf_to_each_spine = max(
+            1, math.ceil(links_per_leaf / spines_per_plane)
+        )
+        two_tier_ok = spine_ports_used <= spine_ports
+        return (
+            spines_per_plane,
+            links_per_leaf_to_each_spine,
+            spine_ports_used,
+            two_tier_ok,
+        )
+
+    spines_per_plane = links_per_leaf
+    links_per_leaf_to_each_spine = 1
+    spine_ports_used = math.ceil(leaves_per_plane / spine_to_leaf_fanout)
+
+    # Try link bundling to reduce spine count while respecting spine radix.
+    # Never bundle below MIN_TIER_SWITCHES spines (redundant spine pair).
+    for b in range(links_per_leaf, 1, -1):
+        if links_per_leaf % b:
+            continue
+        spines_candidate = links_per_leaf // b
+        if spines_candidate < MIN_TIER_SWITCHES:
+            continue
+        candidate = math.ceil((leaves_per_plane * b) / spine_to_leaf_fanout)
+        if candidate <= spine_ports:
+            if b > 1:
+                links_per_leaf_to_each_spine = b
+                spines_per_plane = spines_candidate
+                spine_ports_used = candidate
+            break
+
+    spine_redundancy_ok = links_per_leaf >= MIN_TIER_SWITCHES
+    if spines_per_plane < MIN_TIER_SWITCHES and spine_redundancy_ok:
+        links_per_leaf_to_each_spine = links_per_leaf // MIN_TIER_SWITCHES
+        spines_per_plane = MIN_TIER_SWITCHES
+        spine_ports_used = math.ceil(
+            (leaves_per_plane * links_per_leaf_to_each_spine) / spine_to_leaf_fanout
+        )
+
+    two_tier_ok = spine_ports_used <= spine_ports and spine_redundancy_ok
+    return (
+        spines_per_plane,
+        links_per_leaf_to_each_spine,
+        spine_ports_used,
+        two_tier_ok,
+    )
 
 
 def _parsePortRatio(ratio: str) -> tuple[float, float]:
@@ -445,37 +516,19 @@ def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
 
     # --- 2-tier sizing (first-pass) -------------------------------------
     links_per_leaf = uplink_ports * leaf_to_spine_fanout
-
-    # Classic: one link per (leaf, spine) pair -> `links_per_leaf` spines
-    spines_per_plane = links_per_leaf
-    links_per_leaf_to_each_spine = 1
-    spine_ports_used = math.ceil(leaves_per_plane / spine_to_leaf_fanout)
-
-    # Try link bundling to reduce spine count while respecting spine radix.
-    # Never bundle below MIN_TIER_SWITCHES spines (redundant spine pair).
-    for b in range(links_per_leaf, 1, -1):
-        if links_per_leaf % b:
-            continue
-        spines_candidate = links_per_leaf // b
-        if spines_candidate < MIN_TIER_SWITCHES:
-            continue
-        candidate = math.ceil((leaves_per_plane * b) / spine_to_leaf_fanout)
-        if candidate <= inp.spine_ports:
-            if b > 1:
-                links_per_leaf_to_each_spine = b
-                spines_per_plane = spines_candidate
-                spine_ports_used = candidate
-            break
-
+    (
+        spines_per_plane,
+        links_per_leaf_to_each_spine,
+        spine_ports_used,
+        two_tier_ok,
+    ) = _size_two_tier_spines(
+        links_per_leaf,
+        leaves_per_plane,
+        spine_to_leaf_fanout,
+        inp.spine_ports,
+        inp.aggressive_design,
+    )
     spine_redundancy_ok = links_per_leaf >= MIN_TIER_SWITCHES
-    if spines_per_plane < MIN_TIER_SWITCHES and spine_redundancy_ok:
-        links_per_leaf_to_each_spine = links_per_leaf // MIN_TIER_SWITCHES
-        spines_per_plane = MIN_TIER_SWITCHES
-        spine_ports_used = math.ceil(
-            (leaves_per_plane * links_per_leaf_to_each_spine) / spine_to_leaf_fanout
-        )
-
-    two_tier_ok = spine_ports_used <= inp.spine_ports and spine_redundancy_ok
     plane_kwargs = dict(
         nic_speed_raw=inp.nic_speed,
         nic_speed=nic_plan_speed,
@@ -504,9 +557,20 @@ def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
             f"(leaves={leaves_per_plane}, {spines_per_plane} spines/plan, "
             f"each spine uses {spine_ports_used}/{inp.spine_ports} ports)."
         )
-        notes.append(
-            f"Spine redundancy: at least {MIN_TIER_SWITCHES} spines per plan."
-        )
+        if inp.aggressive_design:
+            total_uplinks = leaves_per_plane * links_per_leaf
+            notes.append(
+                f"Aggressive sizing: spine count is the minimum that absorbs "
+                f"{total_uplinks} leaf uplinks on {inp.spine_ports}-port spines "
+                f"({spines_per_plane} spines). This may not be a complete even "
+                f"Clos mesh; best practice would keep equal links from every "
+                f"leaf to every spine and at least {MIN_TIER_SWITCHES} spines."
+            )
+        else:
+            notes.append(
+                f"Best-practice sizing: even full leaf-spine mesh with at least "
+                f"{MIN_TIER_SWITCHES} spines per plan."
+            )
         if inp.super_spine_speed:
             notes.append(
                 f"Super-spine ({inp.super_spine_speed}G) not required at this "
@@ -540,12 +604,12 @@ def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
 
     # 2-tier not sufficient.
     if inp.super_spine_speed == 0:
-        if not spine_redundancy_ok:
+        if not inp.aggressive_design and not spine_redundancy_ok:
             notes.append(
                 f"2-tier infeasible: leaf uplinks support only {links_per_leaf} "
                 f"spine path(s), but at least {MIN_TIER_SWITCHES} spines per plan "
-                f"are required for redundancy. Increase leaf uplink capacity or "
-                f"enable a super-spine tier."
+                f"are required for redundancy. Increase leaf uplink capacity, "
+                f"enable aggressive sizing, or enable a super-spine tier."
             )
         else:
             notes.append(
@@ -616,10 +680,18 @@ def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
 
     leaves_per_pod = spine_ports_down * spine_to_leaf_fanout
 
-    # Each pod uses a full spine-leaf mesh without bundling.
-    spines_per_pod = _clampTierSwitchCount(
-        links_per_leaf
-    )  # = uplink_ports * leaf_to_spine_fanout
+    # Each pod uses a full spine-leaf mesh without bundling (best practice),
+    # or the fewest pod spines that fill down-ports (aggressive).
+    if inp.aggressive_design:
+        pod_uplinks = leaves_per_pod * links_per_leaf
+        down_capacity = spine_ports_down * spine_to_leaf_fanout
+        spines_per_pod = _clampTierSwitchCount(
+            math.ceil(pod_uplinks / down_capacity), aggressive=True
+        )
+    else:
+        spines_per_pod = _clampTierSwitchCount(
+            links_per_leaf
+        )  # = uplink_ports * leaf_to_spine_fanout
     pods_per_plane = math.ceil(leaves_per_plane / leaves_per_pod)
     spines_per_plane_3t = spines_per_pod * pods_per_plane
 
@@ -633,7 +705,8 @@ def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
     )
     links_absorbed_per_super = inp.super_spine_ports * super_to_spine_fanout
     super_spines_per_plane = _clampTierSwitchCount(
-        math.ceil(total_spine_super_links / links_absorbed_per_super)
+        math.ceil(total_spine_super_links / links_absorbed_per_super),
+        aggressive=inp.aggressive_design,
     )
     ports_used_per_super = (
         inp.super_spine_ports
@@ -644,10 +717,11 @@ def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
     # bundling. We flag infeasibility only if a spine can't even fan out
     # at one link per super-spine that holds it.
     spine_reach = spine_ports_up * spine_to_super_fanout
+    min_tier = 1 if inp.aggressive_design else MIN_TIER_SWITCHES
     feasible = (
         spine_reach >= 1
-        and super_spines_per_plane >= MIN_TIER_SWITCHES
-        and spines_per_pod >= MIN_TIER_SWITCHES
+        and super_spines_per_plane >= min_tier
+        and spines_per_pod >= min_tier
     )
 
     plane_kwargs.update(
@@ -674,10 +748,16 @@ def _design_fabric_compute(inp: DesignInputs) -> DesignResult:
         f"{super_spines_per_plane} super-spines @ {inp.super_spine_speed}G "
         f"with {inp.super_spine_ports} ports each."
     )
-    notes.append(
-        f"Spine and super-spine redundancy: at least {MIN_TIER_SWITCHES} "
-        f"spines per pod and {MIN_TIER_SWITCHES} super-spines per plan."
-    )
+    if inp.aggressive_design:
+        notes.append(
+            "Aggressive sizing: pod spines and super-spines are the minimum "
+            "that fill available ports (no redundant-pair or even-mesh floor)."
+        )
+    else:
+        notes.append(
+            f"Spine and super-spine redundancy: at least {MIN_TIER_SWITCHES} "
+            f"spines per pod and {MIN_TIER_SWITCHES} super-spines per plan."
+        )
     notes.append(
         f"Each spine splits its {inp.spine_ports} ports as "
         f"{spine_ports_down} down (to pod leaves) + {spine_ports_up} up "
@@ -1095,9 +1175,10 @@ def build_bill_of_materials(result: DesignResult) -> BillOfMaterials:
             f"many options."
         )
 
+    sizing_label = "aggressive" if inp.aggressive_design else "best-practice"
     context_line = (
         f"Based on {inp.num_gpus:,} GPU(s) with a {inp.leaf_spine_ratio} "
-        f"leaf-to-spine ratio"
+        f"leaf-to-spine ratio ({sizing_label} sizing)"
     )
     if inp.spine_super_ratio != "1:1":
         context_line += f" and {inp.spine_super_ratio} spine-to-super-spine ratio"
@@ -1840,6 +1921,7 @@ DEFAULTS = dict(
     leaf_spine_ratio="1:1",
     spine_super_ratio="1:1",
     match_interface_speed_to_nic=False,
+    aggressive_design=False,
 )
 
 LEAF_SPINE_RATIOS = ("1:1", "1:1.1", "1:1.16", "1:1.20")
@@ -1919,6 +2001,9 @@ def index():
                 match_interface_speed_to_nic=(
                     request.form.get("match_interface_speed_to_nic", "no") == "yes"
                 ),
+                aggressive_design=(
+                    request.form.get("aggressive_design", "no") == "yes"
+                ),
             )
             if form["num_gpus"] <= 0:
                 raise ValueError("Number of GPUs must be positive.")
@@ -1955,6 +2040,8 @@ def index():
                 )
             if not isinstance(form["match_interface_speed_to_nic"], bool):
                 raise ValueError("Match interface speed to NIC must be yes or no.")
+            if not isinstance(form["aggressive_design"], bool):
+                raise ValueError("Aggressive sizing must be yes or no.")
             if (
                 form["plans_per_nic"] > 0
                 and form["nic_speed"] % form["plans_per_nic"] != 0
