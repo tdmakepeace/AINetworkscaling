@@ -642,6 +642,62 @@
       display: none;
     }
 
+    .label-with-note {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+    .label-with-note label {
+      margin-bottom: 0;
+    }
+    .note-popup-wrap {
+      position: relative;
+      flex-shrink: 0;
+    }
+    .note-popup-btn {
+      width: 20px;
+      height: 20px;
+      padding: 0;
+      border: 1px solid var(--amd-red);
+      border-radius: 50%;
+      background: var(--amd-red-dim);
+      color: var(--amd-red-hover);
+      font-size: 12px;
+      font-weight: 700;
+      line-height: 1;
+      cursor: pointer;
+    }
+    .note-popup-btn:hover,
+    .note-popup-btn[aria-expanded="true"] {
+      background: var(--amd-red);
+      color: #fff;
+    }
+    .note-popup {
+      display: none;
+      position: absolute;
+      right: 0;
+      left: auto;
+      top: calc(100% + 8px);
+      z-index: 40;
+      width: 260px;
+      padding: 12px 14px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+      color: var(--text);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .note-popup.is-open {
+      display: block;
+    }
+    .note-popup p {
+      margin: 0;
+      color: var(--muted);
+    }
+
     .rail-modal {
       display: none;
       position: fixed;
@@ -857,6 +913,39 @@
         </select>
       </div>
 
+      <div class="field">
+        <div class="label-with-note">
+          <label for="aggressive_design">Aggressive sizing (minimum devices)</label>
+          <span class="note-popup-wrap">
+            <button
+              type="button"
+              id="aggressive-note-btn"
+              class="note-popup-btn"
+              aria-expanded="false"
+              aria-controls="aggressive-note-popup"
+              title="Sizing note"
+            >
+              i
+            </button>
+            <div
+              id="aggressive-note-popup"
+              class="note-popup"
+              role="dialog"
+              aria-labelledby="aggressive-note-title"
+              aria-hidden="true"
+            >
+              <p id="aggressive-note-title">
+                Best practice is full-mesh Clos with even bundling; aggressive would size by port capacity instead.
+              </p>
+            </div>
+          </span>
+        </div>
+        <select id="aggressive_design" name="aggressive_design">
+          <option value="no" {% if not form.aggressive_design %}selected{% endif %}>No (best practice)</option>
+          <option value="yes" {% if form.aggressive_design %}selected{% endif %}>Yes</option>
+        </select>
+      </div>
+
       <div class="row">
         <div class="field">
           <label for="leaf_speed">Leaf port speed</label>
@@ -971,6 +1060,7 @@
                 {{ result.plane.spines_per_pod }}/pod &times; {{ result.plane.pods_per_plane }} pod(s) &times; {{ result.num_planes }} plan(s)
               {% else %}
                 {{ result.plane.spines_per_plane }}/plan &times; {{ result.num_planes }} plan(s)
+                · {{ "aggressive" if result.inputs.aggressive_design else "best practice" }}
               {% endif %}
             </div>
           </div>
@@ -1160,6 +1250,7 @@
             <input type="hidden" name="plans_per_nic" value="{{ form.plans_per_nic }}" />
             <input type="hidden" name="spine_super_ratio" value="{{ form.spine_super_ratio }}" />
             <input type="hidden" name="match_interface_speed_to_nic" value="{% if form.match_interface_speed_to_nic %}yes{% else %}no{% endif %}" />
+            <input type="hidden" name="aggressive_design" value="{% if form.aggressive_design %}yes{% else %}no{% endif %}" />
             {% if form.rail_design %}<input type="hidden" name="rail_design" value="on" />{% endif %}
             <label for="compare_leaf_spine_ratio">Leaf-to-spine ratio</label>
             <select id="compare_leaf_spine_ratio" name="leaf_spine_ratio">
@@ -1632,6 +1723,37 @@
       }
 
       btnCopy.addEventListener("click", copyDiagramImage);
+    })();
+  </script>
+  <script>
+    (function () {
+      var btn = document.getElementById("aggressive-note-btn");
+      var popup = document.getElementById("aggressive-note-popup");
+      if (!btn || !popup) return;
+
+      function setOpen(open) {
+        popup.classList.toggle("is-open", open);
+        popup.setAttribute("aria-hidden", open ? "false" : "true");
+        btn.setAttribute("aria-expanded", open ? "true" : "false");
+      }
+
+      function isOpen() {
+        return popup.classList.contains("is-open");
+      }
+
+      btn.addEventListener("click", function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        setOpen(!isOpen());
+      });
+      document.addEventListener("click", function (e) {
+        if (!isOpen()) return;
+        if (popup.contains(e.target) || btn.contains(e.target)) return;
+        setOpen(false);
+      });
+      document.addEventListener("keydown", function (e) {
+        if (e.key === "Escape" && isOpen()) setOpen(false);
+      });
     })();
   </script>
 </body>
